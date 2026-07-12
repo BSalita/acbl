@@ -1,0 +1,21 @@
+# Junctions to shared libraries (each has its own repo; see mklinks.bat)
+mlBridge/
+acbllib/
+chatlib/
+streamlitlib/
+
+# Secrets
+.env
+
+# Environments / caches
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Run artifacts
+logs/
+validation_output/
+
+# Retired scripts (pre-version-control archive)
+old/

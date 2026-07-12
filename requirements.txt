@@ -1,0 +1,27 @@
+# do not list libraries built into python. e.g. collections, json, pickle, re, time
+# not sure why altair doesn't need to be listed. Maybe because it's only used internal to streamlit?
+#jupyter
+#notebook
+#jupyterlab_execute_time
+numpy<2.0.0
+pathlib
+python-dotenv
+pandas
+polars
+html5lib
+lxml
+pyarrow
+adbc-driver-sqlite
+requests
+urllib3
+endplay
+duckdb
+matplotlib>=3.6.0
+requests
+seaborn
+bs4
+scikit-learn
+fastai
+IPython
+sqlalchemy
+sqlalchemy_utils
