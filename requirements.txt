@@ -3,7 +3,7 @@
 #jupyter
 #notebook
 #jupyterlab_execute_time
-numpy<2.0.0
+numpy
 pathlib
 python-dotenv
 pandas
@@ -16,7 +16,7 @@ requests
 urllib3
 endplay
 duckdb
-matplotlib>=3.6.0
+matplotlib
 requests
 seaborn
 bs4
