@@ -52,7 +52,8 @@ acblPath = rootPath.joinpath('acbl')
 def get_club_schemas():
     """Return SQL selects and schemas for club data."""
     sql_selects_d = {
-        'events':'SELECT id AS event_id, club_id_number, type AS event_type, board_scoring_method, tb_count, club_session, club_class, is_virtual_game, virtualGameType FROM events',
+        # mpLimits aliased to mp_limit so club/tournament Elo share one strata column.
+        'events':'SELECT id AS event_id, club_id_number, type AS event_type, board_scoring_method, tb_count, club_session, club_class, is_virtual_game, virtualGameType, mpLimits AS mp_limit FROM events',
         'board_results':'SELECT id AS board_result_id, board_id, round_number, table_number, CAST(ns_pair AS INTEGER) AS ns_pair, CAST(ew_pair AS INTEGER) AS ew_pair, ns_score, ew_score, contract, declarer, ew_match_points, ns_match_points, opening_lead, result, tricks_taken FROM board_results',
         'boards':'SELECT id AS board_id, section_id, board_number FROM boards',
         'pair_summaries':'SELECT id AS pair_summary_id, section_id, CAST(pair_number AS INTEGER) AS pair_number, direction FROM pair_summaries',
@@ -75,6 +76,7 @@ def get_club_schemas():
             'club_class': pl.UInt8,
             'is_virtual_game': pl.Boolean,
             'virtualGameType': pl.UInt8,
+            'mp_limit': pl.String,
         },
         'board_results':
         {
@@ -587,22 +589,39 @@ def tournament_board_results_clean():
     return brs_df
 
 
+def _parse_club_tournament_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Clean ACBL board results from SQLite.")
+    parser.add_argument("--club", action="store_true", help="Process club data only")
+    parser.add_argument("--tournament", action="store_true", help="Process tournament data only")
+    args = parser.parse_args()
+    if not args.club and not args.tournament:
+        return ["club", "tournament"]
+    modes = []
+    if args.club:
+        modes.append("club")
+    if args.tournament:
+        modes.append("tournament")
+    return modes
+
+
 if __name__ == "__main__":
 
     from mlBridge import print_started, print_ended
     program_start_time = print_started()
 
-    t = time.time()
-    club_board_results_clean()
-    print(f"Club board results clean elapsed time in seconds: {time.time()-t}")
-    print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-    print("-" * 70, "\n")
-
-    t = time.time()
-    tournament_board_results_clean()
-    print(f"Tournament board results clean elapsed time in seconds: {time.time()-t}")
-    print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-    print("-" * 70, "\n")
+    for club_or_tournament in _parse_club_tournament_args():
+        t = time.time()
+        if club_or_tournament == "club":
+            club_board_results_clean()
+        elif club_or_tournament == "tournament":
+            # Uses existing acbl_club_board_results_cleaned.parquet for MasterPoints enrichment.
+            tournament_board_results_clean()
+        else:
+            raise ValueError(f"Invalid club_or_tournament: {club_or_tournament}")
+        print(f"{club_or_tournament} board results clean elapsed time in seconds: {time.time()-t}")
+        print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+        print("-" * 70, "\n")
 
     print_ended(program_start_time)
 

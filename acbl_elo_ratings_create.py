@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
 
+from acbl_strata import club_strata_bucket, tournament_strata_bucket
+
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 
@@ -177,10 +179,11 @@ def create_elo_ratings(club_or_tournament):
     
     # Select only necessary columns
     regex_cols = [
-            'Date', 'is_virtual_game', 'session_id', 'Round', 'Board', 'Pair_Number_(NS|EW)', 
-            'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)', 
+            'Date', 'is_virtual_game', 'session_id', 'Round', 'Board', 'Pair_Number_(NS|EW)',
+            'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)',
             'MasterPoints_[NESW]', 'MasterPoints_(NS|EW)', 'Pct_NS',
             'DD_Tricks_Diff', 'Is_Par_Suit', 'Is_Par_Contract', 'Is_Sacrifice', # must use board results augmented to get these columns
+            'mp_limit',  # event MP ceiling for Strata filter (club mpLimits / tournament mp_limit)
         ]
     read_cols = [col for col in df.columns if any(re.match(regex, col) for regex in regex_cols)]
     
@@ -192,6 +195,36 @@ def create_elo_ratings(club_or_tournament):
     if 'is_virtual_game' not in df.columns:
         print("Adding is_virtual_game column to df...")
         df = df.with_columns([pl.lit(False).alias('is_virtual_game')])
+
+    if 'mp_limit' not in df.columns:
+        raise RuntimeError(
+            f"{acbl_board_results_filename} is missing mp_limit. "
+            "Rebuild cleaned/augmented board results after pulling mpLimits "
+            "(club) or mp_limit (tournament) through acbl_sql_to_board_results_clean.py."
+        )
+
+    # Normalize event MP limits to strata_bucket once per session, then broadcast.
+    print("Computing strata_bucket from mp_limit...")
+    bucket_fn = club_strata_bucket if club_or_tournament == "club" else tournament_strata_bucket
+    session_limits = (
+        df.select(["session_id", "mp_limit"])
+        .unique(subset=["session_id"], keep="first")
+    )
+    session_buckets = session_limits.with_columns(
+        pl.Series(
+            "strata_bucket",
+            [bucket_fn(v) for v in session_limits.get_column("mp_limit").to_list()],
+        )
+    )
+    df = df.join(session_buckets.select(["session_id", "strata_bucket"]), on="session_id", how="left")
+    print(
+        "strata_bucket counts:\n",
+        df.select(["session_id", "strata_bucket"])
+        .unique()
+        .group_by("strata_bucket")
+        .len()
+        .sort("len", descending=True),
+    )
     
     # Sort temporally to calculate Elo
     print("Sorting data temporally...")
@@ -209,7 +242,7 @@ def create_elo_ratings(club_or_tournament):
         player_global_stdev_ns=seeds.get("player_ns"),
         player_global_stdev_ew=seeds.get("player_ew"),
     )
-        # Save full Elo ratings
+    # Save full Elo ratings
     acbl_club_elo_ratings_filename = f'acbl_{club_or_tournament}_elo_ratings.parquet'
     acbl_club_elo_ratings_file = acblPath.joinpath(acbl_club_elo_ratings_filename)
     df.write_parquet(acbl_club_elo_ratings_file)
