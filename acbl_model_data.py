@@ -755,6 +755,7 @@ def create_model_data(
             'NSPair',
             'EWPair',
             'scores_l',
+            'mp_limit',  # event MP ceiling; used by Elo strata, not ML features
         ]
     elif club_or_tournament == 'tournament':
         shouldnt_exist_features = [
