@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Create ACBL prediction data (train/test split).
 
 Streaming, full-volume, fixed-temporal-cutoff version (refactored 2026-04).
@@ -48,7 +48,7 @@ CLI:
 
 Why chunk by year (the default):
     The lazy plan keeps ~6,000 wide columns through 6 chained left joins. Even
-    in streaming mode, processing 50M rows × 6k cols at once builds enormous
+    in streaming mode, processing 50M rows Ã— 6k cols at once builds enormous
     per-batch state (the original eager-mode peak was 2.8 TB of pagefile).
     Filtering the source to one year at a time (~6M rows) cuts peak intermediate
     state ~8x and makes streaming actually fit. Per-year shards are written, then
@@ -119,7 +119,14 @@ from typing import Optional
 import polars as pl
 import psutil
 
-sys.path.append(str(pathlib.Path.cwd().parent.joinpath('mlBridge')))
+_SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
+_MLBRIDGE = _SRC_DIR / 'mlBridge'
+if not _MLBRIDGE.is_dir():
+    raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
+for _p in (_SRC_DIR, _MLBRIDGE):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
 import mlBridge  # noqa: E402
 
 rootPath = pathlib.Path('e:/bridge/data')

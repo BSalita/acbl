@@ -1,4 +1,4 @@
-"""
+﻿"""
 Shared hyperparameter search utilities for ACBL prediction targets.
 
 Strategy: coordinate descent.
@@ -45,7 +45,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import polars as pl
 
-sys.path.append(str(pathlib.Path.cwd().parent.joinpath('mlBridgeLib')))
+_SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
+_MLBRIDGE = _SRC_DIR / 'mlBridge'
+if not _MLBRIDGE.is_dir():
+    raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
+for _p in (_SRC_DIR, _MLBRIDGE):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
 
 import mlBridge  # noqa: F401  (used for pd_options_display in callers)
 from mlBridge.mlBridgeAiLib import (
@@ -61,7 +68,7 @@ SAVED_MODELS_PATH = ACBL_PATH.joinpath('SavedModels')
 
 Y_NAMES = ['Declarer_Direction', 'Contract', 'Pct_NS']
 
-# Pct_NS now uses ONLY pre-board features — Contract / Declarer_Direction
+# Pct_NS now uses ONLY pre-board features â€” Contract / Declarer_Direction
 # are auction outcomes and are excluded. Mirrors the rule in
 # acbl_prediction_train.py.
 TARGETS_TO_KEEP: Dict[str, List[str]] = {
@@ -72,13 +79,13 @@ TARGETS_TO_KEEP: Dict[str, List[str]] = {
 
 SPLIT_INDICATOR_COLS = ['is_train_set', 'is_val_set', 'is_test_set']
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Pct_NS feature pruning
 #
 # After the first run on the pre-auction-only feature set the importance
 # report (acbl_club_predicted_pct_ns_torch_model_importance.csv) made it
-# clear that 78 % of the 6035 inputs sit at the noise floor (importance ≈
-# 13–14, vs MasterPoints_* ≈ 90 and Elo_* ≈ 22). They add training cost,
+# clear that 78 % of the 6035 inputs sit at the noise floor (importance â‰ˆ
+# 13â€“14, vs MasterPoints_* â‰ˆ 90 and Elo_* â‰ˆ 22). They add training cost,
 # inflate the input dim, and act as random feature noise for SGD without
 # meaningfully informing Pct_NS. Drop the three biggest, weakest families:
 #
@@ -86,15 +93,15 @@ SPLIT_INDICATOR_COLS = ['is_train_set', 'is_val_set', 'is_test_set']
 #      The fully-broken-out expected-value cube. The compact summaries
 #      (EV_*_Max, EV_<pair>_<dir>_<strain>_<level>, EV_<other>) are kept.
 #   2. Probs_<pair>_<dir>_<strain>_<level>                       (560 cols)
-#      Per-(pair,strain,level) make-probability table. Same story — the
+#      Per-(pair,strain,level) make-probability table. Same story â€” the
 #      coarser DD signals retain the equity information.
 #   3. C_<seat><suit><rank>                                      (208 cols)
-#      Per-card Boolean indicators (does East hold ♦4?). Fully redundant
+#      Per-card Boolean indicators (does East hold â™¦4?). Fully redundant
 #      with HCP_*, SL_*, DP_*, QT_*, LTC_*, DD_* summaries that we keep.
 #
-# Total drop: ~4688 features → leaves ~1347 informative inputs.
+# Total drop: ~4688 features â†’ leaves ~1347 informative inputs.
 # Re-enable any of these by removing the matching pattern below.
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 import re as _re
 
 PCT_NS_DROP_PATTERNS: List[str] = [
@@ -109,7 +116,7 @@ def prune_pct_ns_features(df: pl.DataFrame, *, verbose: bool = True) -> pl.DataF
     """Drop the noisy high-cardinality feature families for Pct_NS.
 
     No-op for any column not matching `PCT_NS_DROP_PATTERNS`. Safe to call
-    on the test DataFrame too — the Pct_NS column itself never matches.
+    on the test DataFrame too â€” the Pct_NS column itself never matches.
     """
     to_drop = [c for c in df.columns if any(rx.match(c) for rx in _PCT_NS_DROP_REGEXES)]
     if not to_drop:
@@ -120,9 +127,9 @@ def prune_pct_ns_features(df: pl.DataFrame, *, verbose: bool = True) -> pl.DataF
     return df.drop(to_drop)
 
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Data loading
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def load_data(
     club_or_tournament: str,
@@ -141,7 +148,7 @@ def load_data(
     `train_sample_rows` / `test_sample_rows`: when provided, only the LAST N
     rows are read via `pl.scan_parquet().slice(...)`. The slice push-down
     skips earlier row groups so RAM usage and disk I/O are bounded. CRITICAL
-    for the v2 club parquet (165 GB on disk, ~250 GB decoded — eager load
+    for the v2 club parquet (165 GB on disk, ~250 GB decoded â€” eager load
     exceeds 192 GB RAM and triggers pagefile thrashing).
 
     We deliberately take the TAIL rather than the HEAD: the train parquet is
@@ -153,7 +160,7 @@ def load_data(
     `drop_regex_patterns`: when provided, columns matching ANY of these
     regexes are excluded at scan time via `.select(pl.exclude(...))`. This
     pushes the projection into the parquet reader so the dropped columns are
-    never decoded. Essential for Pct_NS — the v2 club parquet has 6,042
+    never decoded. Essential for Pct_NS â€” the v2 club parquet has 6,042
     columns and ~4,700 of them are EV/Probs/per-card noise-floor families
     that get dropped immediately by `prune_pct_ns_features`. Pruning at scan
     time changes a 10M-row slice from 240 GB to ~50 GB.
@@ -207,7 +214,7 @@ def build_working_dfs(
     """Drop the OTHER y targets to avoid leakage; keep temporally-prior ones.
 
     Also applies target-specific feature pruning (e.g. Pct_NS noise-floor
-    families — see `PCT_NS_DROP_PATTERNS`).
+    families â€” see `PCT_NS_DROP_PATTERNS`).
     """
     keep = TARGETS_TO_KEEP.get(y_name, [])
     other_targets = [t for t in Y_NAMES if t != y_name and t not in keep and t in model_df.columns]
@@ -219,9 +226,9 @@ def build_working_dfs(
     return working_df, working_test_df
 
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Class-weight helpers (Contract uses these)
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def compute_class_counts(
     working_df_for_training: pl.DataFrame,
@@ -256,10 +263,10 @@ def class_weights_from_counts(
     """Convert raw counts into a normalized weight vector.
 
     Modes (all normalized so mean(weights) == 1):
-      * None / 'none'      → no weighting (return None)
-      * 'inverse_freq'     → weights ∝ 1 / count_k (most aggressive)
-      * 'sqrt_inverse_freq'→ weights ∝ 1 / sqrt(count_k) (moderate)
-      * 'log_inverse_freq' → weights ∝ 1 / log(1 + count_k) (gentle)
+      * None / 'none'      â†’ no weighting (return None)
+      * 'inverse_freq'     â†’ weights âˆ 1 / count_k (most aggressive)
+      * 'sqrt_inverse_freq'â†’ weights âˆ 1 / sqrt(count_k) (moderate)
+      * 'log_inverse_freq' â†’ weights âˆ 1 / log(1 + count_k) (gentle)
     """
     if mode is None or mode == 'none':
         return None
@@ -279,9 +286,9 @@ def class_weights_from_counts(
     return weights
 
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Schema / shard helpers
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def cleanup_shards(model_name: str) -> None:
     for p in SAVED_MODELS_PATH.glob(f"{model_name}_shard_*.pt"):
@@ -351,7 +358,7 @@ def build_shards_once(
     effective_shard_rows = shard_rows_count
     if est_shards < 2 and num_rows > 0:
         effective_shard_rows = max(1, num_rows // 2)
-        print(f"[shards] Adjusted shard_rows_count {shard_rows_count:,} → {effective_shard_rows:,} "
+        print(f"[shards] Adjusted shard_rows_count {shard_rows_count:,} â†’ {effective_shard_rows:,} "
               f"to ensure >=2 shards (rows={num_rows:,})")
     create_torch_shards(
         working_df_for_training,
@@ -362,9 +369,9 @@ def build_shards_once(
     return schema_d
 
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Single trial
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _save_schema_to_disk(schema_d: Dict[str, Any], model_name: str) -> None:
     """Persist the (possibly mutated) schema so predict_model picks it up."""
@@ -475,9 +482,9 @@ def run_trial(
     return metrics
 
 
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Coordinate-descent search
-# ──────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _print_summary_line(record: Dict[str, Any], selection_metric: str) -> None:
     mv = record.get(selection_metric)
@@ -507,7 +514,7 @@ def _print_summary_line(record: Dict[str, Any], selection_metric: str) -> None:
                 parts.append(f"{k}={v:{fmt}}")
         except Exception:
             parts.append(f"{k}={v}")
-    print("   → " + "  ".join(parts))
+    print("   â†’ " + "  ".join(parts))
 
 
 def coordinate_descent_search(
@@ -524,7 +531,7 @@ def coordinate_descent_search(
     """Top-level: load data, build shards once, sweep axes, return (best_config, all_trials)."""
     overall_t = time.time()
     print(f"\n{'='*72}")
-    print(f"HYPERPARAMETER SEARCH — {y_name} ({club_or_tournament})")
+    print(f"HYPERPARAMETER SEARCH â€” {y_name} ({club_or_tournament})")
     print(f"{'='*72}")
     print(f"Baseline:")
     for k, v in baseline.items():
@@ -605,7 +612,7 @@ def coordinate_descent_search(
                     'wall_s': time.time() - t0,
                 }
             except Exception as e:
-                print(f"   ❌ trial failed: {type(e).__name__}: {e}")
+                print(f"   âŒ trial failed: {type(e).__name__}: {e}")
                 record = {
                     'trial': trial_idx,
                     'axis': axis_name,
@@ -623,7 +630,7 @@ def coordinate_descent_search(
             try:
                 pl.DataFrame(all_trials).write_csv(output_csv)
             except Exception as e:
-                print(f"   ⚠️ Could not write CSV: {e}")
+                print(f"   âš ï¸ Could not write CSV: {e}")
 
         # Pick best for this axis
         scored = [
@@ -631,7 +638,7 @@ def coordinate_descent_search(
             if isinstance(r.get(selection_metric), (int, float)) and not np.isnan(r[selection_metric])
         ]
         if not scored:
-            print(f"   ⚠️ No valid scores for axis '{axis_name}'; keeping current best={best_config[axis_name]!r}")
+            print(f"   âš ï¸ No valid scores for axis '{axis_name}'; keeping current best={best_config[axis_name]!r}")
             continue
         if selection_better == 'lower':
             best_record = min(scored, key=lambda r: r[selection_metric])
@@ -647,7 +654,7 @@ def coordinate_descent_search(
 
     total_min = (time.time() - overall_t) / 60.0
     print(f"\n{'='*72}")
-    print(f"SEARCH COMPLETE — {len(all_trials)} trials in {total_min:.1f} min")
+    print(f"SEARCH COMPLETE â€” {len(all_trials)} trials in {total_min:.1f} min")
     print(f"{'='*72}")
     print(f"FINAL BEST CONFIG ({y_name}):")
     for k, v in best_config.items():

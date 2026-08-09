@@ -1,4 +1,4 @@
-"""
+﻿"""
 Train ACBL prediction models.
 
 Takes 6h/8.5h for 15m/14m rows x 5963/5963 columns.
@@ -18,7 +18,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import sys
 # Windows powershell defaults to cp1252; force UTF-8 so the various status-line
-# emoji/glyphs printed below (✅, 📊, 📦, 🔁, …) don't crash the script with
+# emoji/glyphs printed below (âœ…, ðŸ“Š, ðŸ“¦, ðŸ”, â€¦) don't crash the script with
 # UnicodeEncodeError. Same fix as in acbl_hp_search_lib.py.
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -36,7 +36,14 @@ import time
 from typing import Any, Optional, Dict, List, Tuple, Union
 import numpy as np
 
-sys.path.append(str(pathlib.Path.cwd().parent.joinpath('mlBridgeLib')))
+_SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
+_MLBRIDGE = _SRC_DIR / 'mlBridge'
+if not _MLBRIDGE.is_dir():
+    raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
+for _p in (_SRC_DIR, _MLBRIDGE):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
 
 import mlBridge
 from mlBridge.mlBridgeAiLib import (
@@ -344,7 +351,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     df_test = pl.read_parquet(acbl_prediction_data_test_file)
     print(f"Loaded {acbl_prediction_data_test_filename}: shape:{df_test.shape} size:{acbl_prediction_data_test_file.stat().st_size}")
 
-    # ── Enum -> Categorical compatibility shim (2026-04-21) ─────────────────
+    # â”€â”€ Enum -> Categorical compatibility shim (2026-04-21) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # acbl_prediction_data.py emits categorical features as pl.Enum (required
     # for streaming-safe sink_parquet). The training stack in
     # mlBridge/mlBridgeAiLib.py predates that switch and still assumes
@@ -376,7 +383,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     #     # Verify split indicators are preserved in working dataframes
     #     assert 'is_train_set' in working_df.columns, "Split indicators missing from training data"
     #     assert 'is_test_set' in working_test_df.columns, "Split indicators missing from test data"
-    #     print(f"✅ Split indicators preserved for {y_name}")
+    #     print(f"âœ… Split indicators preserved for {y_name}")
 
     #     # save model-ready data (includes split indicators as metadata)
     #     acbl_club_model_data_filename = f"acbl_{club_or_tournament}_working_{y_name.lower()}.parquet"
@@ -391,10 +398,10 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
     importlib.reload(mlBridge.mlBridgeAiLib)
     from mlBridge.mlBridgeAiLib import predict_model
 
-    # ── Classifier prediction caches (currently unused by Pct_NS) ───────────────
+    # â”€â”€ Classifier prediction caches (currently unused by Pct_NS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Reserved for future stacking experiments. We still populate
     # `test_classifier_preds[y]` (full-model test predictions for each classifier
-    # `y`) at no extra cost, but the per-row OOF generation step is skipped — see
+    # `y`) at no extra cost, but the per-row OOF generation step is skipped â€” see
     # the note where Pct_NS's `targets_to_keep` is set, and the OOF block at the
     # end of this loop. `oof_classifier_preds` is intentionally left empty.
     oof_classifier_preds: Dict[str, pl.DataFrame] = {}
@@ -411,12 +418,12 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # score, par contracts, expected values, LTC, etc.) and seating data (which players
         # are at which seat, master points, Elo and other quality metrics). It must NOT see
         # any results or auction-derived signals. In particular, Contract and
-        # Declarer_Direction are auction outcomes and are excluded — even though they are
+        # Declarer_Direction are auction outcomes and are excluded â€” even though they are
         # temporally prior to Pct_NS, they are not "knowable before the boards start to be
         # played" and were creating an information channel from the auction into the
         # regressor (previously bridged via OOF stacking, see comments below).
         # The upstream parquet (acbl_prediction_data.py, game_state=5) already restricts
-        # columns to game-state levels 0–4 (board / deal / event / players / session), so
+        # columns to game-state levels 0â€“4 (board / deal / event / players / session), so
         # the only remaining results-leakage risk is the two classification targets.
         targets_to_keep = {
             'Declarer_Direction': [],
@@ -435,13 +442,13 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # Drop the noisy high-cardinality feature families for Pct_NS (per-card
         # Booleans, fully-broken-out EV cube, per-(strain,level) Probs table).
         # See `PCT_NS_DROP_PATTERNS` in acbl_hp_search_lib.py for the full
-        # rationale — based on the importance report from the first
+        # rationale â€” based on the importance report from the first
         # post-leakage-fix run, those ~4688 columns sat at the noise floor.
         if y_name == 'Pct_NS':
             working_df = prune_pct_ns_features(working_df, verbose=True)
             working_test_df = prune_pct_ns_features(working_test_df, verbose=False)
 
-        # ── OOF stacking is intentionally NOT applied for Pct_NS ─────────────────────
+        # â”€â”€ OOF stacking is intentionally NOT applied for Pct_NS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Historically Pct_NS was trained with Declarer_Direction and Contract as input
         # features, replaced at train time with OOF predictions to avoid train/serve
         # skew. Pct_NS now uses only pre-auction information (see `targets_to_keep`),
@@ -457,12 +464,12 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # Verify split indicators are present
         for col in split_indicator_cols:
             if col not in working_df.columns:
-                print(f"⚠️  WARNING: Split indicator '{col}' not found in working_df")
+                print(f"âš ï¸  WARNING: Split indicator '{col}' not found in working_df")
 
         # Create training dataframe with split indicators EXCLUDED from features
         # Split indicators will remain in the dataframe for metadata/tracking but won't be trained on
         working_df_for_training = working_df.drop(split_indicator_cols, strict=False)
-        print(f"✅ Excluded {len([c for c in split_indicator_cols if c in working_df.columns])} split indicator columns from training features")
+        print(f"âœ… Excluded {len([c for c in split_indicator_cols if c in working_df.columns])} split indicator columns from training features")
         print(f"   Training on {len(working_df_for_training.columns)} features (including target '{y_name}')")
 
         model_name = f"acbl_{club_or_tournament}_predicted_{y_name.lower()}_torch_model"
@@ -493,7 +500,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # Early-stopping patience (epochs without val_loss improvement). 0 disables.
         optimal_early_stop_patience = 3
 
-        # ── Declarer_Direction (club): hp search results, 18 trials, 156.9 min ─
+        # â”€â”€ Declarer_Direction (club): hp search results, 18 trials, 156.9 min â”€
         # Best test_accuracy = 0.6016 (vs 0.5923 with old defaults). Smaller
         # network won by ~1pp; weight_decay was unnecessary; longer patience
         # helped weaker configs converge but didn't help the winner. See
@@ -503,10 +510,10 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             optimal_weight_decay = 0.0
             optimal_early_stop_patience = 5
 
-        # ── Contract (club): hp search results, 17 trials, 158.6 min ──────────
+        # â”€â”€ Contract (club): hp search results, 17 trials, 158.6 min â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Best test_accuracy = 0.3131 (vs 0.1942 with old defaults; +11.9 pp).
         # The biggest single win was DISABLING inverse-frequency class
-        # weighting — the gentler sqrt/log variants also hurt accuracy. Higher
+        # weighting â€” the gentler sqrt/log variants also hurt accuracy. Higher
         # dropout (0.20) and lower lr (3e-4) added small additional gains.
         # See e:/bridge/data/acbl/acbl_hp_search_contract_club.csv.
         if y_name == 'Contract':
@@ -515,18 +522,18 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             optimal_weight_decay = 0.0
             optimal_early_stop_patience = 5
 
-        # ── Pct_NS (club): from acbl_hp_search_pct_ns.py --club ───────────────
+        # â”€â”€ Pct_NS (club): from acbl_hp_search_pct_ns.py --club â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # 20-trial coordinate-descent search on the pruned 1347-feature input
         # (acbl_hp_search_pct_ns_club.csv). Best test_mae=0.263274,
         # variance_ratio=0.165, best_val_loss=0.092705 @ epoch 17.
         #   - The smallest of 4 candidate architectures won. Pre-board signal is
         #     limited; bigger nets just memorize noise without generalizing.
-        #   - lr 3e-4 (3× the manual quick-fix). The pruned input is well-
+        #   - lr 3e-4 (3Ã— the manual quick-fix). The pruned input is well-
         #     conditioned enough to tolerate a faster step.
         #   - y_range=(0,1) saturated again (test_mae=0.434, ~"predict the
-        #     mean"). Sigmoid bound stays off — clip downstream if needed.
+        #     mean"). Sigmoid bound stays off â€” clip downstream if needed.
         #   - weight_decay and bs were essentially flat across candidates;
-        #     winners shown but ±0.0005 in mae either way.
+        #     winners shown but Â±0.0005 in mae either way.
         if y_name == 'Pct_NS':
             optimal_layers = [512, 256, 128]
             optimal_dropout = 0.05
@@ -546,7 +553,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             savedModelsPath, 
             model_name, 
             y_name,
-            # 🔧 SHARED PARAMETERS: Must match between training and inference
+            # ðŸ”§ SHARED PARAMETERS: Must match between training and inference
             layers=optimal_layers,  # Network architecture
             dropout=optimal_dropout,  # Dropout rate for model structure
             apply_scaling_parameters=True,  # Enable feature scaling (targets are not scaled)
@@ -555,13 +562,13 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         )
         model_type = schema_d['model_type']
         print(f"Model type detected: {model_type}")
-        print(f"🏗️ Architecture saved in schema: {optimal_layers} (dropout={optimal_dropout}, y_range={optimal_y_range})")
+        print(f"ðŸ—ï¸ Architecture saved in schema: {optimal_layers} (dropout={optimal_dropout}, y_range={optimal_y_range})")
 
         # Verify schema contains correct architecture
         schema_layers = schema_d.get('mlp_layers', schema_d.get('layers', []))
-        print(f"🔍 Schema layers: {schema_layers}")
+        print(f"ðŸ” Schema layers: {schema_layers}")
         if schema_layers != optimal_layers:
-            print(f"⚠️ WARNING: Schema layers don't match! Expected {optimal_layers}, got {schema_layers}")
+            print(f"âš ï¸ WARNING: Schema layers don't match! Expected {optimal_layers}, got {schema_layers}")
 
         # remove all shards to free up space.
         print("Removing all shards to free up space...")
@@ -585,8 +592,8 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             shard_rows_count=effective_shard_rows_count,
             apply_scaling=True,  # Enable scaling of features
         )
-        print(f"✅ Feature scaling enabled for inputs; targets remain unscaled")
-        print(f"✅ Split indicators excluded from training shards")
+        print(f"âœ… Feature scaling enabled for inputs; targets remain unscaled")
+        print(f"âœ… Split indicators excluded from training shards")
 
         # takes 10m/12m
         # Remove old shards if they exist. Determine scale parameters, scale, create shard files.
@@ -607,19 +614,19 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # Check actual target distribution
         if model_type == 'regression':
             target_stats = working_df_for_training[y_name].describe()
-            print(f"📊 Target distribution: {target_stats}")
+            print(f"ðŸ“Š Target distribution: {target_stats}")
             actual_min = float(working_df_for_training[y_name].min())
             actual_max = float(working_df_for_training[y_name].max())
-            print(f"📊 Actual range: {actual_min:.3f} to {actual_max:.3f}")
+            print(f"ðŸ“Š Actual range: {actual_min:.3f} to {actual_max:.3f}")
 
         # Class weights: disabled for both classifiers.
         # The hp search (acbl_hp_search_contract.py, 17 trials) showed that
-        # ALL inverse-frequency variants — full, sqrt, and log — degraded
+        # ALL inverse-frequency variants â€” full, sqrt, and log â€” degraded
         # Contract test_accuracy vs unweighted training:
-        #   class_weights=None              → 0.3131
-        #   class_weights=log_inverse_freq  → 0.3087  (-0.4 pp)
-        #   class_weights=sqrt_inverse_freq → 0.2788  (-3.4 pp)
-        #   class_weights=inverse_freq (old)→ 0.1942  (-11.9 pp; broke training)
+        #   class_weights=None              â†’ 0.3131
+        #   class_weights=log_inverse_freq  â†’ 0.3087  (-0.4 pp)
+        #   class_weights=sqrt_inverse_freq â†’ 0.2788  (-3.4 pp)
+        #   class_weights=inverse_freq (old)â†’ 0.1942  (-11.9 pp; broke training)
         # The model learns the natural class distribution better than any
         # reweighting. Declarer_Direction is balanced across N/E/S/W and was
         # never weighted. To re-enable an experiment, see compute_class_counts
@@ -635,7 +642,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
 
         # Adjust batch size for small dataset
         # optimal_bs = 512  # Smaller batch to add gradient noise
-        # print(f"🔧 Adjusting batch size from 32768 to {optimal_bs} for dataset size {len(working_df)}")
+        # print(f"ðŸ”§ Adjusting batch size from 32768 to {optimal_bs} for dataset size {len(working_df)}")
 
         model, model_path, stats = train_model_from_shards(
             schema_d,
@@ -652,13 +659,13 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             verbose=True
         )
 
-        # 🔍 CAPTURE INPUT AND PREDICTIONS FOR DEBUGGING
-        print(f"📊 Capturing input data for model: {model_name}")
+        # ðŸ” CAPTURE INPUT AND PREDICTIONS FOR DEBUGGING
+        print(f"ðŸ“Š Capturing input data for model: {model_name}")
 
         # Save input data for debugging
         input_capture_path = acblPath.joinpath(f"debug_input_{y_name.lower()}.parquet")
         working_test_df.write_parquet(input_capture_path)
-        print(f"✅ Input data saved to: {input_capture_path}")
+        print(f"âœ… Input data saved to: {input_capture_path}")
         print(f"   Shape: {working_test_df.shape}")
         print(f"   Columns: {len(working_test_df.columns)}")
 
@@ -718,7 +725,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         # Save predictions for debugging
         predictions_capture_path = acblPath.joinpath(f"debug_predictions_{y_name.lower()}.parquet")
         prediction_df.write_parquet(predictions_capture_path)
-        print(f"✅ Predictions saved to: {predictions_capture_path}")
+        print(f"âœ… Predictions saved to: {predictions_capture_path}")
         print(f"   Shape: {prediction_df.shape}")
 
         print(prediction_df)
@@ -745,7 +752,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         fi.write_csv(acbl_club_model_data_importance_file, quote_style='non_numeric', include_bom=True)
         print(f"Saved {acbl_club_model_data_importance_filename}: shape:{fi.shape} size:{acbl_club_model_data_importance_file.stat().st_size}")
 
-        # ── OOF stacking generation: disabled ───────────────────────────────────────
+        # â”€â”€ OOF stacking generation: disabled â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Pct_NS no longer consumes Declarer_Direction or Contract as features (see
         # `targets_to_keep` above), so there is no downstream consumer for OOF
         # predictions. The 2-fold OOF generation step (~equal in cost to the main
@@ -755,7 +762,7 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
             pred_col = f"{y_name}_Pred"
             if pred_col in prediction_df.columns:
                 test_classifier_preds[y_name] = prediction_df.select([pred_col])
-                print(f"📦 Cached full-model test predictions for {y_name}: {len(prediction_df):,} rows")
+                print(f"ðŸ“¦ Cached full-model test predictions for {y_name}: {len(prediction_df):,} rows")
 
         # Free per-target intermediates and GPU cache
         try:
@@ -793,9 +800,9 @@ if __name__ == "__main__":
 
 # # important! make sure saved model files are moved to the proper place for inferencing.
 
-# # 🔍 DEBUG COMPARISON CELL - Read captured data and compare accuracy
+# # ðŸ” DEBUG COMPARISON CELL - Read captured data and compare accuracy
 # print("=" * 80)
-# print("🔍 DEBUGGING CAPTURED DATA AND PREDICTIONS")
+# print("ðŸ” DEBUGGING CAPTURED DATA AND PREDICTIONS")
 # print("=" * 80)
 
 # # Define paths for captured data
@@ -809,41 +816,41 @@ if __name__ == "__main__":
 #             'input_path': input_path,
 #             'predictions_path': predictions_path
 #         }
-#         print(f"✅ Found debug files for {y_name}")
+#         print(f"âœ… Found debug files for {y_name}")
 #     else:
-#         print(f"❌ Missing debug files for {y_name}")
+#         print(f"âŒ Missing debug files for {y_name}")
 #         if not input_path.exists():
 #             print(f"   Missing: {input_path}")
 #         if not predictions_path.exists():
 #             print(f"   Missing: {predictions_path}")
 
-# print(f"\n📊 Found debug files for {len(debug_files)} targets: {list(debug_files.keys())}")
+# print(f"\nðŸ“Š Found debug files for {len(debug_files)} targets: {list(debug_files.keys())}")
 
 # # Process each captured dataset
 # for y_name, paths in debug_files.items():
 #     print(f"\n{'='*60}")
-#     print(f"🎯 ANALYZING {y_name.upper()}")
+#     print(f"ðŸŽ¯ ANALYZING {y_name.upper()}")
 #     print(f"{'='*60}")
     
 #     # Load captured input data
-#     print(f"📥 Loading input data from: {paths['input_path']}")
+#     print(f"ðŸ“¥ Loading input data from: {paths['input_path']}")
 #     captured_input_df = pl.read_parquet(paths['input_path'])
 #     print(f"   Input shape: {captured_input_df.shape}")
     
 #     # Load captured predictions
-#     print(f"📥 Loading predictions from: {paths['predictions_path']}")
+#     print(f"ðŸ“¥ Loading predictions from: {paths['predictions_path']}")
 #     captured_predictions_df = pl.read_parquet(paths['predictions_path'])
 #     print(f"   Predictions shape: {captured_predictions_df.shape}")
     
 #     # Show basic info about the captured data
-#     print(f"\n📊 INPUT DATA SUMMARY:")
+#     print(f"\nðŸ“Š INPUT DATA SUMMARY:")
 #     print(f"   Columns: {len(captured_input_df.columns)}")
 #     print(f"   Rows: {len(captured_input_df):,}")
 #     if 'Date' in captured_input_df.columns:
 #         date_range = captured_input_df['Date'].describe()
 #         print(f"   Date range: {date_range}")
     
-#     print(f"\n📊 PREDICTIONS SUMMARY:")
+#     print(f"\nðŸ“Š PREDICTIONS SUMMARY:")
 #     pred_col = f"{y_name}_Pred"
 #     if pred_col in captured_predictions_df.columns:
 #         if y_name == 'Pct_NS':  # Regression
@@ -878,8 +885,8 @@ if __name__ == "__main__":
 #             print(f"\n   Top 10 actual values:")
 #             print(actual_counts.head(10))
     
-#     # 🔄 RE-RUN PREDICTION ON CAPTURED INPUT FOR COMPARISON
-#     print(f"\n🔄 RE-RUNNING PREDICTION ON CAPTURED INPUT...")
+#     # ðŸ”„ RE-RUN PREDICTION ON CAPTURED INPUT FOR COMPARISON
+#     print(f"\nðŸ”„ RE-RUNNING PREDICTION ON CAPTURED INPUT...")
 #     model_name = f"acbl_{club_or_tournament}_predicted_{y_name.lower()}_torch_model"
     
 #     try:
@@ -889,11 +896,11 @@ if __name__ == "__main__":
 #             captured_input_df[y_name].alias(y_name),
 #         ])
         
-#         print(f"✅ New prediction completed")
+#         print(f"âœ… New prediction completed")
 #         print(f"   New predictions shape: {new_prediction_df.shape}")
         
 #         # Compare old vs new predictions
-#         print(f"\n🔍 COMPARING OLD vs NEW PREDICTIONS:")
+#         print(f"\nðŸ” COMPARING OLD vs NEW PREDICTIONS:")
         
 #         if pred_col in captured_predictions_df.columns and pred_col in new_prediction_df.columns:
 #             # Check if predictions are identical
@@ -932,13 +939,13 @@ if __name__ == "__main__":
 #                 print(f"   MSE difference: {new_mse - old_mse:.8f}")
         
 #     except Exception as e:
-#         print(f"❌ Error re-running prediction: {str(e)}")
+#         print(f"âŒ Error re-running prediction: {str(e)}")
 #         print(f"   This might indicate a problem with the model or input data")
 
 # print(f"\n{'='*80}")
-# print("🎯 DEBUGGING SUMMARY COMPLETE")
-# print("📝 Use this information to compare with results from the other program")
-# print("🔍 Look for differences in:")
+# print("ðŸŽ¯ DEBUGGING SUMMARY COMPLETE")
+# print("ðŸ“ Use this information to compare with results from the other program")
+# print("ðŸ” Look for differences in:")
 # print("   - Input data shape and content")
 # print("   - Prediction distributions")
 # print("   - Accuracy metrics")
@@ -946,7 +953,7 @@ if __name__ == "__main__":
 # print("="*80)
 # # Test the updated schema generation with feature dtypes
 # print("=" * 80)
-# print("🧪 TESTING UPDATED SCHEMA GENERATION WITH FEATURE DTYPES")
+# print("ðŸ§ª TESTING UPDATED SCHEMA GENERATION WITH FEATURE DTYPES")
 # print("=" * 80)
 
 # # Create a small test dataframe to verify schema generation
@@ -957,13 +964,13 @@ if __name__ == "__main__":
 #     'Date'                                       # date feature
 # ])
 
-# print(f"📊 Test dataframe shape: {test_df.shape}")
-# print(f"📊 Test dataframe schema:")
+# print(f"ðŸ“Š Test dataframe shape: {test_df.shape}")
+# print(f"ðŸ“Š Test dataframe schema:")
 # for col, dtype in test_df.schema.items():
 #     print(f"  {col}: {dtype}")
 
 # # Test schema generation for Contract (classification)
-# print(f"\n🔧 Testing schema generation for Contract (classification)...")
+# print(f"\nðŸ”§ Testing schema generation for Contract (classification)...")
 # test_model_name = "test_contract_schema"
 # test_schema = generate_and_save_schema(
 #     test_df, 
@@ -976,14 +983,14 @@ if __name__ == "__main__":
 #     verbose=True
 # )
 
-# print(f"\n✅ Schema generated successfully!")
-# print(f"📋 Schema keys: {list(test_schema.keys())}")
+# print(f"\nâœ… Schema generated successfully!")
+# print(f"ðŸ“‹ Schema keys: {list(test_schema.keys())}")
 
 # # Check if feature_dtypes is in the schema
 # if 'feature_dtypes' in test_schema:
-#     print(f"\n🎯 SUCCESS: feature_dtypes found in schema!")
-#     print(f"📊 Number of features with dtypes: {len(test_schema['feature_dtypes'])}")
-#     print(f"📊 Sample feature dtypes:")
+#     print(f"\nðŸŽ¯ SUCCESS: feature_dtypes found in schema!")
+#     print(f"ðŸ“Š Number of features with dtypes: {len(test_schema['feature_dtypes'])}")
+#     print(f"ðŸ“Š Sample feature dtypes:")
 #     for i, (feature, dtype) in enumerate(test_schema['feature_dtypes'].items()):
 #         if i < 10:  # Show first 10
 #             print(f"  {feature}: {dtype}")
@@ -991,58 +998,58 @@ if __name__ == "__main__":
 #             print(f"  ... and {len(test_schema['feature_dtypes']) - 10} more features")
 #             break
 # else:
-#     print(f"❌ ERROR: feature_dtypes not found in schema!")
+#     print(f"âŒ ERROR: feature_dtypes not found in schema!")
 
 # # Verify schema version
 # schema_version = test_schema.get('schema_version', 'unknown')
-# print(f"\n📋 Schema version: {schema_version}")
+# print(f"\nðŸ“‹ Schema version: {schema_version}")
 # if schema_version == "1.1":
-#     print(f"✅ Schema version updated correctly to 1.1")
+#     print(f"âœ… Schema version updated correctly to 1.1")
 # else:
-#     print(f"⚠️  Schema version is {schema_version}, expected 1.1")
+#     print(f"âš ï¸  Schema version is {schema_version}, expected 1.1")
 
 # # Clean up test schema file
 # test_schema_file = savedModelsPath / f"{test_model_name}_schema.json"
 # if test_schema_file.exists():
 #     test_schema_file.unlink()
-#     print(f"\n🧹 Cleaned up test schema file: {test_schema_file}")
+#     print(f"\nðŸ§¹ Cleaned up test schema file: {test_schema_file}")
 
 # print(f"\n{'='*80}")
-# print(f"🎉 SCHEMA TESTING COMPLETE")
+# print(f"ðŸŽ‰ SCHEMA TESTING COMPLETE")
 # print(f"{'='*80}")
 
-# # 📋 SUMMARY: Training Schema Enhanced with Feature Dtypes
+# # ðŸ“‹ SUMMARY: Training Schema Enhanced with Feature Dtypes
 
 # print("=" * 80)
-# print("📋 TRAINING SCHEMA ENHANCEMENT SUMMARY")
+# print("ðŸ“‹ TRAINING SCHEMA ENHANCEMENT SUMMARY")
 # print("=" * 80)
 
 # print("""
-# 🎯 CHANGES MADE:
+# ðŸŽ¯ CHANGES MADE:
 
-# 1. ✅ Enhanced generate_and_save_schema_core() function in mlBridgeAiLib.py
+# 1. âœ… Enhanced generate_and_save_schema_core() function in mlBridgeAiLib.py
 #    - Added 'feature_dtypes' mapping to schema
 #    - Maps each training feature to its original Polars dtype
 #    - Enables precise dtype tracking for training features
 
-# 2. ✅ Updated schema version from "1.0" to "1.1"
+# 2. âœ… Updated schema version from "1.0" to "1.1"
 #    - Reflects the new feature dtype information
 #    - Maintains backward compatibility awareness
 
-# 3. ✅ Enhanced verbose output
+# 3. âœ… Enhanced verbose output
 #    - Shows count of features with recorded dtypes
 #    - Provides better visibility into schema contents
 
-# 4. ✅ Updated both library files
+# 4. âœ… Updated both library files
 #    - mlBridgeAiLib.py (main file)
 #    - mlBridgeAiLib copy.py (backup/alternative file)
 
-# 5. ✅ Added test cell to verify functionality
+# 5. âœ… Added test cell to verify functionality
 #    - Tests schema generation with sample data
 #    - Validates feature_dtypes presence and content
 #    - Confirms schema version update
 
-# 📊 SCHEMA STRUCTURE (New in v1.1):
+# ðŸ“Š SCHEMA STRUCTURE (New in v1.1):
 # {
 #   "schema_version": "1.1",
 #   "feature_column_list": [...],
@@ -1057,13 +1064,13 @@ if __name__ == "__main__":
 #   ... (existing fields)
 # }
 
-# 🔧 USAGE:
+# ðŸ”§ USAGE:
 # - The feature_dtypes field contains a mapping of feature_name -> dtype_string
 # - Dtype strings are Polars dtype representations (e.g., "Float32", "Boolean", "Categorical")
 # - This enables precise tracking of what dtypes were used during training
 # - Useful for debugging, validation, and ensuring consistency between training and inference
 
-# 🎉 BENEFITS:
+# ðŸŽ‰ BENEFITS:
 # - Better debugging capabilities for dtype mismatches
 # - Precise documentation of training feature types
 # - Enhanced schema validation possibilities
@@ -1071,6 +1078,6 @@ if __name__ == "__main__":
 # """)
 
 # print("=" * 80)
-# print("✅ SCHEMA ENHANCEMENT COMPLETE")
+# print("âœ… SCHEMA ENHANCEMENT COMPLETE")
 # print("=" * 80)
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 acbl_results_hand_records_augment.py
@@ -29,7 +29,14 @@ from collections import defaultdict
 import sys
 import time
 
-sys.path.append(str(pathlib.Path.cwd().parent.joinpath('mlBridgeLib')))
+_SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
+_MLBRIDGE = _SRC_DIR / 'mlBridge'
+if not _MLBRIDGE.is_dir():
+    raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
+for _p in (_SRC_DIR, _MLBRIDGE):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
 import mlBridge.mlBridgeAugmentLib as mlBridgeAugmentLib
 
 rootPath = pathlib.Path('e:/bridge/data')

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 acbl_club_results_sql_to_board_results_clean.py
@@ -39,7 +39,14 @@ import pathlib
 import time
 import sys
 
-sys.path.append(str(pathlib.Path.cwd().parent.joinpath('mlBridgeLib')))
+_SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
+_MLBRIDGE = _SRC_DIR / 'mlBridge'
+if not _MLBRIDGE.is_dir():
+    raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
+for _p in (_SRC_DIR, _MLBRIDGE):
+    _s = str(_p)
+    if _s not in sys.path:
+        sys.path.append(_s)
 import mlBridge.mlBridgeLib as mlBridgeLib
 
 # override pandas display options
