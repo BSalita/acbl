@@ -17,7 +17,14 @@ Wall-clock baselines (dev box: 192 GB RAM, ~40 cores, NVMe E:):
                 (55.4M train + 3.8M test rows -> 165 GB train + 10 GB test)
                 See "KNOWN ISSUE (2026-04-21)" block below for the per-year
                 breakdown and what we tried to root-cause it.
-    Measured 2026-04-20 -> 2026-04-21 (logs/04_prediction_data_club.log).
+    Measured 2026-04-20 -> 2026-04-21 (logs/04_prediction_data_club.log),
+    reading the single merged model_data parquet at 59.5M club rows.
+    Estimate at current volume (69.4M club rows, 2026-08-16, scaling the
+    non-anomalous ~0.26 ms/row sink rate): club ~5 h (+2.5 h if the 2022
+    anomaly repeats), tournament ~0.5-1 h. Since 2026-08-16 the source is
+    the monthly shard dir (resolve_model_data_source): per-year scans prune
+    to ~12 shard files instead of scanning the whole ~86 GB merged file,
+    which may shave another 10-30% off the scan side -- remeasure on next run.
 
 Why fixed-date cutoff (was: quantile-based 90th percentile):
     Quantile-based splits can leak across seasons (a single hot-streak month in
@@ -238,6 +245,67 @@ EXTRA_PROJECTION_DROPS = {
 }
 
 
+def resolve_model_data_source(
+    acblPath: pathlib.Path,
+    club_or_tournament: str,
+) -> tuple[list[pathlib.Path], str, int]:
+    """Locate the model-data source: shard directory (preferred) or merged file.
+
+    acbl_model_data.py defaults to --no-merge-shards (2026-08-16): it leaves
+    monthly shards + manifest.json in shards_{mode}_model_data/. Scanning the
+    shard list is faster than a merged file for every downstream pattern
+    (file-level Date pruning), so we prefer it whenever it exists.
+
+    Returns (paths, description, total_bytes). paths is a list usable with
+    pl.scan_parquet(). When manifest.json exists, the shard set is validated
+    against it: missing shards or unlisted extras (e.g. leftovers from a run
+    with a different --months-per-chunk) are hard errors, because both would
+    silently drop or double-count rows.
+    """
+    import json
+
+    shard_dir = acblPath.joinpath(f"shards_{club_or_tournament}_model_data")
+    shard_files = (
+        sorted(shard_dir.glob('window=*.parquet')) if shard_dir.is_dir() else []
+    )
+    if shard_files:
+        manifest_path = shard_dir.joinpath('manifest.json')
+        if manifest_path.exists():
+            m = json.loads(manifest_path.read_text(encoding='utf-8'))
+            listed = [shard_dir.joinpath(e['file']) for e in m['shards']]
+            missing = [p.name for p in listed if not p.exists()]
+            if missing:
+                raise FileNotFoundError(
+                    f"{manifest_path} lists {len(missing)} missing shard(s), "
+                    f"e.g. {missing[:3]} -- rerun acbl_model_data.py"
+                )
+            extras = sorted(
+                {p.name for p in shard_files} - {p.name for p in listed}
+            )
+            if extras:
+                raise RuntimeError(
+                    f"{shard_dir} contains {len(extras)} shard(s) not in "
+                    f"manifest.json, e.g. {extras[:3]} -- stale windows from a "
+                    f"different chunk size? Delete them or rerun acbl_model_data.py"
+                )
+            shard_files = listed
+        else:
+            print(f"WARNING: {shard_dir} has no manifest.json (incomplete "
+                  f"acbl_model_data.py run?); using glob of "
+                  f"{len(shard_files)} shards unchecked")
+        total = sum(p.stat().st_size for p in shard_files)
+        desc = f"{shard_dir.name} ({len(shard_files)} shards)"
+        return shard_files, desc, total
+
+    merged = acblPath.joinpath(f"acbl_{club_or_tournament}_model_data.parquet")
+    if not merged.exists():
+        raise FileNotFoundError(
+            f"Neither shard dir {shard_dir} nor merged file {merged} exists; "
+            f"run acbl_model_data.py first"
+        )
+    return [merged], merged.name, merged.stat().st_size
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -397,9 +465,9 @@ def prepare_prediction_data(
     print(f"Game state levels: {requested_game_state}, read_cols: {len(read_cols)}")
 
     # --- 2. Validate read_cols against source schema (no data load) -------
-    src_path = acblPath.joinpath(f"acbl_{club_or_tournament}_model_data.parquet")
-    src_schema = pl.read_parquet_schema(src_path)
-    print(f"Source: {src_path.name} size={src_path.stat().st_size / (1024**3):.2f}GB cols={len(src_schema)}")
+    src_paths, src_desc, src_bytes = resolve_model_data_source(acblPath, club_or_tournament)
+    src_schema = pl.scan_parquet(src_paths).collect_schema()
+    print(f"Source: {src_desc} size={src_bytes / (1024**3):.2f}GB cols={len(src_schema)}")
 
     missing = read_cols - set(src_schema.keys())
     assert not missing, f"columns in read_cols but not in source: {sorted(missing)}"
@@ -432,7 +500,7 @@ def prepare_prediction_data(
     # Used to count final columns and verify no leftover String/List/Object/
     # Struct columns. Pure schema walk; no data materialised.
     diag_lf = _build_joined_plan(
-        pl.scan_parquet(src_path).select(sorted(read_cols)).head(0),
+        pl.scan_parquet(src_paths).select(sorted(read_cols)).head(0),
         player_elo=player_elo, pair_elo=pair_elo,
     )
     diag_schema = diag_lf.collect_schema()
@@ -464,10 +532,10 @@ def prepare_prediction_data(
     # ======================================================================
     if not chunk_years:
         print("\nBuilding single lazy plan (no year chunking)...")
-        base = pl.scan_parquet(src_path).select(sorted(read_cols))
+        base = pl.scan_parquet(src_paths).select(sorted(read_cols))
         if max_rows is not None:
             if recent:
-                total_rows = pl.scan_parquet(src_path).select(pl.len()).collect()[0, 0]
+                total_rows = pl.scan_parquet(src_paths).select(pl.len()).collect()[0, 0]
                 offset = max(0, total_rows - max_rows)
                 actual_take = min(max_rows, total_rows)
                 base = base.slice(offset, actual_take)
@@ -509,7 +577,7 @@ def prepare_prediction_data(
 
         # Determine year range from source Date column (cheap; uses parquet stats)
         date_bounds = (
-            pl.scan_parquet(src_path)
+            pl.scan_parquet(src_paths)
             .select(
                 pl.col('Date').cast(pl.Date).min().alias('mn'),
                 pl.col('Date').cast(pl.Date).max().alias('mx'),
@@ -565,7 +633,7 @@ def prepare_prediction_data(
                 t = time.time()
 
                 base = (
-                    pl.scan_parquet(src_path)
+                    pl.scan_parquet(src_paths)
                     .select(sorted(read_cols))
                     .filter(
                         (pl.col('Date').cast(pl.Date) >= s_start)

@@ -1,5 +1,19 @@
 @echo off
-setlocal
+setlocal EnableExtensions
+:: Use project venv (has requests, polars, torch, ...). Bare `python` on PATH
+:: is often the system install and will fail with ModuleNotFoundError.
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" (
+  echo *** FAILED: project venv not found: %PY%
+  echo Create it with: python -m venv .venv ^& .venv\Scripts\pip install -r requirements.txt
+  exit /b 1
+)
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+:: Success marker for :pyrun. Ctrl+C then "Terminate batch job? N" clears
+:: ERRORLEVEL to 0, so `if errorlevel 1` alone lets the next step run.
+:: Only a successful python exit creates this file (via &&); missing file = abort.
+set "STEP_OK=%TEMP%\acbl_all_step.ok"
 echo ======================================================================
 echo  ACBL Full Pipeline
 echo  Produces data files consumed by:
@@ -9,7 +23,10 @@ echo.
 echo  Approximate end-to-end wall time on the dev box
 echo  (192 GB RAM, ~40-core CPU, NVMe E:, RTX 5080):
 echo    Cold start (no caches, fresh DD/SD work): ~2 days dominated by 3a (~38 h)
-echo    Warm rerun  (3a cache hits, just incremental work): ~12-14 h + 5c
+echo    Warm rerun  (3a cache hits, just incremental work): ~10-12 h + 5c
+echo      (was ~12-14 h; 5a shard-output change of 2026-08-16 removed the
+echo       single-file merge and cut 5a to ~15 min tournament / ~1 min resume.
+echo       5b now reads shards too -- remeasure on next full run.)
 echo    Stage 5c (train all 6 models) measured 30.4 h on 2026-07-10 -^> 2026-07-11.
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
@@ -17,6 +34,7 @@ echo  Last full-pipeline timing baseline: 2026-07-07 -^> 2026-07-11 (see logs/).
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
+echo Using: %PY%
 echo Start: %date% %time%
 echo.
 call :now PIPE_T0
@@ -33,41 +51,35 @@ echo [Stage 1] Data ingestion...
 ::         Cold start (full ACBL backlog): many hours, network-bound.
 ::         Daily incremental: ~minutes.
 echo   [1a] Downloading club results to JSON...
-call :now STEP_T0
-python acbl_club_download_to_json.py --sleep 2
+call :pyrun 1a acbl_club_download_to_json.py --sleep 2
 if errorlevel 1 goto :error
-call :toc 1a
 
 :: ---- 1b ----
 :: READS:  acbl/club-results/*/details/*.data.json
-:: WRITES: acbl/club-results/*/details/*.data.sql
-::         acbl/acbl_club_results.sqlite
-:: TIME:   ~minutes incremental; ~1-2 h on a full rebuild from scratch.
-echo   [1b] Loading club JSON into SQLite...
-call :now STEP_T0
-python acbl_club_json_to_sql.py
+:: WRITES: acbl/club_results_parquet/*.parquet
+::         acbl/acbl_club_results.sqlite   (same schema as legacy)
+:: TIME:   parallel JSON->Parquet->SQLite (option F). Cold rebuild target
+::         ~0.5-1.5 h on 64-core/512GB vs ~4 h legacy .data.sql path.
+::         Use: python acbl_club_json_to_sql.py --legacy-sql-scripts
+echo   [1b] Loading club JSON into SQLite (via Parquet)...
+call :pyrun 1b acbl_club_json_to_sql.py
 if errorlevel 1 goto :error
-call :toc 1b
 
 :: ---- 1c ----
 :: READS:  (ACBL API via ACBL_API_KEY)
 :: WRITES: acbl/tournaments/events/{sanction_id}.sanction.json
 :: TIME:   incremental; ~minutes daily, ~1-2 h cold start (API-rate-limited).
 echo   [1c] Downloading tournament sanctioned events...
-call :now STEP_T0
-python acbl_tournament_download_sanctioned_events.py
+call :pyrun 1c acbl_tournament_download_sanctioned_events.py
 if errorlevel 1 goto :error
-call :toc 1c
 
 :: ---- 1d ----
 :: READS:  acbl/tournaments/events/*.sanction.json
 :: WRITES: acbl/tournaments/sessions/{session_id}.session.json
 :: TIME:   incremental; ~minutes daily, several hours cold start (API-bound).
 echo   [1d] Downloading tournament sessions...
-call :now STEP_T0
-python acbl_tournament_download_sessions_using_sanctioned_events.py
+call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py
 if errorlevel 1 goto :error
-call :toc 1d
 
 :: ---- 1e ----
 :: READS:  acbl/tournaments/sessions/*.session.json
@@ -75,10 +87,8 @@ call :toc 1d
 ::         acbl/acbl_tournament_results.sqlite
 :: TIME:   ~minutes incremental; ~30-60 min on a full rebuild.
 echo   [1e] Loading tournament sessions into SQLite...
-call :now STEP_T0
-python acbl_tournament_sessions_json_to_sql.py
+call :pyrun 1e acbl_tournament_sessions_json_to_sql.py
 if errorlevel 1 goto :error
-call :toc 1e
 
 :: ====================================================================
 :: STAGE 2: CLEANING -- SQLite -> cleaned parquets
@@ -93,10 +103,8 @@ echo [Stage 2] Cleaning...
 ::         acbl/acbl_tournament_hand_records_cleaned.parquet
 :: TIME:   ~5-10 min total (both club + tournament). SQLite read-bound.
 echo   [2a] Cleaning hand records...
-call :now STEP_T0
-python acbl_sql_to_hand_records_clean.py
+call :pyrun 2a acbl_sql_to_hand_records_clean.py
 if errorlevel 1 goto :error
-call :toc 2a
 
 :: ---- 2b ----
 :: READS:  acbl/acbl_club_results.sqlite        (tables: events, board_results, boards, ...)
@@ -106,10 +114,8 @@ call :toc 2a
 ::         acbl/acbl_tournament_board_results_cleaned.parquet
 :: TIME:   ~15-30 min total. Wider tables, more joins than 2a.
 echo   [2b] Cleaning board results...
-call :now STEP_T0
-python acbl_sql_to_board_results_clean.py
+call :pyrun 2b acbl_sql_to_board_results_clean.py
 if errorlevel 1 goto :error
-call :toc 2b
 
 :: ====================================================================
 :: STAGE 3: AUGMENTATION -- DD/SD/Par analysis + board result enrichment
@@ -128,20 +134,16 @@ echo [Stage 3] Augmentation...
 ::         WARM (cache hits): ~minutes incremental for daily new PBNs.
 ::         By far the longest single step in a cold pipeline rebuild.
 echo   [3a] Augmenting hand records (DD + SD + Par)...
-call :now STEP_T0
-python acbl_hand_records_augment.py
+call :pyrun 3a acbl_hand_records_augment.py
 if errorlevel 1 goto :error
-call :toc 3a
 
 :: ---- 3b ----
 :: READS:  acbl/acbl_{club,tournament}_board_results_cleaned.parquet
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
 :: TIME:   ~5-15 min total (club is the bigger half).
 echo   [3b] Augmenting board results (step 1: contracts + vulnerability)...
-call :now STEP_T0
-python acbl_board_results_augment_step1.py
+call :pyrun 3b acbl_board_results_augment_step1.py
 if errorlevel 1 goto :error
-call :toc 3b
 
 :: ---- 3c ----
 :: READS:  acbl/acbl_{club,tournament}_board_results_augmented_step1.parquet
@@ -149,10 +151,8 @@ call :toc 3b
 :: WRITES: acbl/acbl_{club,tournament}_board_results_augmented.parquet
 :: TIME:   ~30-60 min total. Joins ~6k-col hand-record features into board results.
 echo   [3c] Augmenting board results (step 2: join hand records + full augmentation)...
-call :now STEP_T0
-python acbl_board_results_augment_step2.py
+call :pyrun 3c acbl_board_results_augment_step2.py
 if errorlevel 1 goto :error
-call :toc 3c
 
 :: ====================================================================
 :: STAGE 4: ELO RATINGS
@@ -168,10 +168,8 @@ echo [Stage 4] Elo ratings...
 :: TIME:   ~30-60 min total (tournament ~10 min, club ~30-45 min).
 ::         Walks games chronologically; mostly single-threaded.
 echo   [4] Computing Elo ratings (player + pair)...
-call :now STEP_T0
-python acbl_elo_ratings_create.py
+call :pyrun 4 acbl_elo_ratings_create.py
 if errorlevel 1 goto :error
-call :toc 4
 
 :: ====================================================================
 :: STAGE 5: ML MODEL DATA
@@ -183,36 +181,44 @@ echo [Stage 5] ML model pipeline...
 :: READS:  acbl/acbl_{club,tournament}_hand_records_augmented.parquet
 ::         acbl/acbl_{club,tournament}_board_results_augmented.parquet
 :: WRITES: acbl/acbl_{club,tournament}_model_data_d.pkl
-::         acbl/acbl_{club,tournament}_model_data.parquet
-:: TIME:   tournament ~40 min (15.9M rows x 6780 cols, 16.7 GB parquet).
-::         club      shards ~60 min + final merge ~80 min (59.7M rows x 6772
-::                   cols, 60.6 GB). The merge streams row groups via pyarrow
-::                   (measured 4822 s on 2026-07-08; polars streaming concat
-::                   aborted on this width -- see _stream_concat_shards).
-::         Total ~3 h. Wall clock measured 2026-07-08.
+::         acbl/shards_{club,tournament}_model_data/*.parquet + manifest.json
+::         (default --no-merge-shards since 2026-08-16: the single-file merge
+::         took ~12 h for club and made downstream reads SLOWER; consumers
+::         now scan the shard glob with file-level Date pruning instead)
+:: TIME:   tournament ~15 min (16.7M rows x 6786 cols -> 132 monthly shards,
+::                   15.3 GB; measured 889 s on 2026-08-16).
+::         club      ~60-75 min cold (69.4M rows x 6778 cols -> 96 monthly
+::                   shards, 86 GB; ~60 min measured 2026-04 at 59.7M rows).
+::         Resume (all shards valid): ~1 min per mode (club measured 54 s
+::         on 2026-08-16). Logs: logs/05a_model_data_noshardmerge_*.log.
 echo   [5a] Building model data...
-call :now STEP_T0
-python acbl_model_data.py
+call :pyrun 5a acbl_model_data.py
 if errorlevel 1 goto :error
-call :toc 5a
 
 :: ---- 5b ----
 :: READS:  acbl/acbl_{club,tournament}_model_data_d.pkl
-::         acbl/acbl_{club,tournament}_model_data.parquet
+::         acbl/shards_{club,tournament}_model_data/*.parquet (or legacy
+::         acbl_{club,tournament}_model_data.parquet if no shard dir)
 ::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet
 ::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet
 :: WRITES: acbl/acbl_{club,tournament}_prediction_data_train.parquet
 ::         acbl/acbl_{club,tournament}_prediction_data_test.parquet
-:: TIME:   tournament ~30-60 min (~16M rows, train+test ~42 GB).
-::         club      ~7.3 h (55.2M train + 4.3M test rows; 166 GB train,
-::                   12 GB test parquet). One year (2022) sank in 3 h on its
-::                   own; see script docstring "KNOWN ISSUE (2026-04-21)".
-::         Total ~8 h. Wall clock measured 2026-04-20 -> 2026-04-21.
+:: TIME:   MEASURED 2026-04-20 -> 2026-04-21 (at 59.5M club rows, reading
+::         the single merged model_data file):
+::           tournament ~30-60 min (~16M rows, train+test ~42 GB).
+::           club       ~7.3 h (55.2M train + 4.3M test rows; 166 GB train,
+::                      12 GB test), of which 3 h was one anomalous year
+::                      (2022) -- see script docstring "KNOWN ISSUE".
+::           Non-anomalous sink rate: ~0.26 ms/row.
+::         ESTIMATE at current volume (69.4M club rows, 2026-08-16): club
+::         ~5 h (+2.5 h if the 2022 anomaly repeats), tournament ~0.5-1 h,
+::         total ~6 h expected / ~8.5 h worst case. Source is now the
+::         monthly shard dir (per-year scans prune to ~12 shard files vs
+::         scanning the whole 86 GB merged file), which may shave another
+::         10-30% off the scan side. Remeasure on next full run.
 echo   [5b] Preparing prediction data (train/test split)...
-call :now STEP_T0
-python acbl_prediction_data.py
+call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
-call :toc 5b
 
 :: ---- 5c ----
 :: READS:  acbl/acbl_{club,tournament}_prediction_data_train.parquet
@@ -237,10 +243,8 @@ call :toc 5b
 ::         (a full E: caused a torch.save iostream crash on 2026-07-09).
 ::         Run this step alone (not via acbl_all.bat) when iterating on models.
 echo   [5c] Training prediction models...
-call :now STEP_T0
-python acbl_prediction_train.py
+call :pyrun 5c acbl_prediction_train.py
 if errorlevel 1 goto :error
-call :toc 5c
 
 :: ====================================================================
 :: DONE
@@ -268,7 +272,32 @@ echo    acbl_{club,tournament}_pair_elo_ratings.parquet    (pair lookup)
 echo    SavedModels\*_schema.json                         (model schemas)
 echo    SavedModels\*model_shard_*.pt                     (trained weights)
 echo ======================================================================
+del /q "%STEP_OK%" 2>nul
 goto :eof
+
+:: --------------------------------------------------------------------
+:: Run one python step. Returns exit /b 1 on failure OR Ctrl+C.
+:: Callers MUST check:  if errorlevel 1 goto :error
+::
+:: Two Windows quirks this defends against:
+::  1) Ctrl+C then "Terminate batch job? N" clears ERRORLEVEL to 0.
+::     STEP_OK is only created via `&&` after a successful python exit,
+::     so a missing marker still fails the step.
+::  2) `goto :error` + `exit /b` from inside a CALLed subroutine only
+::     returns to the caller -- the pipeline would continue. So :pyrun
+::     returns /b 1 and the top-level caller jumps to :error.
+::
+:: usage: call :pyrun LABEL script.py [args...]
+:: --------------------------------------------------------------------
+:pyrun
+set "STEP_LABEL=%~1"
+shift
+del /q "%STEP_OK%" 2>nul
+call :now STEP_T0
+"%PY%" %1 %2 %3 %4 %5 %6 %7 %8 %9 && echo.>"%STEP_OK%"
+if not exist "%STEP_OK%" exit /b 1
+call :toc %STEP_LABEL%
+exit /b 0
 
 :: --------------------------------------------------------------------
 :: Timing helpers. Epoch seconds via PowerShell so steps longer than
@@ -294,5 +323,6 @@ goto :eof
 
 :error
 echo.
-echo *** FAILED at %date% %time% (errorlevel %errorlevel%) ***
+echo *** FAILED/INTERRUPTED at step %STEP_LABEL% %date% %time% ***
+del /q "%STEP_OK%" 2>nul
 exit /b 1

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 acbl_model_data.py
@@ -27,23 +27,31 @@ Architecture:
     3. Per-year streaming sink: for each calendar year in the brs Date range,
        scan_parquet(brs).filter(Date in [y, y+1)) -> project -> inner-join
        hrs.lazy() -> sink_parquet(shard, maintain_order=False, zstd:3).
-    4. Final merge: pl.concat([scan(shard) for shard in shards]).sink_parquet
-       to the canonical *_model_data.parquet output path. Shards deleted
-       unless --keep-shards.
+    4. Output: shards stay in shards_{mode}_model_data/ plus a manifest.json
+       (default since 2026-08-16). Downstream consumers scan the shard glob;
+       benchmarks showed monthly shards beat a single merged file on every
+       access pattern (file-level Date pruning: 1.4s vs 674s for a 50-col
+       one-year read) and the single-writer merge recompressed ~86 GB of
+       6,778-col data at ~2 MiB/s (~12 h). Pass --merge-shards only if a
+       single canonical *_model_data.parquet is really needed.
 
 CLI:
     --club, --tournament         (default: both)
     --chunk-years / --no-chunk-years  (default: chunk; recommended)
     --start-year / --end-year    (default: source min/max year, inclusive)
-    --merge-shards / --no-merge-shards  (default: merge into final file)
-    --keep-shards                (default: False; with merge, delete shards after)
+    --merge-shards / --no-merge-shards  (default: NO merge; keep shards + manifest)
+    --keep-shards                (default: False; with --merge-shards, delete shards after)
 
 Wall-clock baselines (dev box: 192 GB RAM, ~40 cores, NVMe E:):
-    tournament: ~40 min   (15.94M rows x 6780 cols -> 16.7 GB parquet)
-    club:       ~60 min   (58.84M rows x 6780 cols -> ~62 GB parquet,
-                           month-chunked then merged)
-    Measured 2026-04-20 (logs/01_model_data_tournament.log,
-                          logs/03_model_data_club_full.log).
+    tournament: ~15 min   (16.73M rows x 6786 cols -> 132 monthly shards,
+                           15.3 GB; measured 889 s on 2026-08-16)
+    club:       ~60-75 min cold (69.45M rows x 6778 cols -> 96 monthly
+                           shards, 86 GB; ~60 min measured 2026-04-20 at
+                           58.84M rows -- grows with data)
+    resume:     ~1 min per mode when all shards validate (club measured
+                           54 s on 2026-08-16)
+    Logs: logs/05a_model_data_noshardmerge_*.log. The removed single-file
+    merge added ~80 min (2026-07, pyarrow) to ~12 h (2026-08, at 86 GB).
 
 Previous steps:
     acbl_board_results_augment_step2.py
@@ -121,11 +129,21 @@ def show_memory_usage(label=''):
 def _build_join_plan(brs_lf, *, hrs_df, brs_read_cols, join_keys):
     """Build the canonical brs.select(cols).join(hrs.lazy(), inner) plan
     on top of an arbitrary brs LazyFrame (e.g. unfiltered scan, or scan
-    with year filter)."""
-    return (
+    with year filter).
+
+    Any Float64 columns are downcast to Float32 in the plan. The dtype
+    conversions computed for the *_model_data_d.pkl metadata only touch the
+    0-row schema frame, never the streamed data, so a source regenerated
+    with f64 columns (e.g. tournament MP_NS/MP_EW, 2026-08) would otherwise
+    trip _validate_plan_schema's no-Float64 assertion."""
+    lf = (
         brs_lf.select(brs_read_cols)
         .join(hrs_df.lazy(), on=join_keys, how='inner')
     )
+    f64_cols = [c for c, dt in lf.collect_schema().items() if dt == pl.Float64]
+    if f64_cols:
+        lf = lf.with_columns([pl.col(c).cast(pl.Float32) for c in f64_cols])
+    return lf
 
 
 def _validate_plan_schema(lf, *, label):
@@ -246,13 +264,46 @@ def _stream_concat_shards(shards, out_path, *, label):
     return size
 
 
+def _write_shard_manifest(shard_dir, shards, *, label):
+    """Write manifest.json describing the complete shard set.
+
+    Consumers assert every listed file still exists (and optionally check
+    row totals) before scanning the shard glob, so a manually deleted or
+    half-written shard fails fast instead of silently dropping months.
+    Row counts are read from parquet footers only (~1 s for ~100 shards).
+    """
+    import json
+    import pyarrow.parquet as pq
+    from datetime import datetime, timezone
+
+    entries = []
+    total_rows = 0
+    for s in shards:
+        if not s.exists():
+            continue
+        n = pq.ParquetFile(str(s)).metadata.num_rows
+        entries.append({'file': s.name, 'rows': n, 'bytes': s.stat().st_size})
+        total_rows += n
+    manifest = {
+        'label': label,
+        'created_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'shard_count': len(entries),
+        'total_rows': total_rows,
+        'shards': entries,
+    }
+    path = shard_dir.joinpath('manifest.json')
+    path.write_text(json.dumps(manifest, indent=1), encoding='utf-8')
+    print(f"Wrote {path}: {len(entries)} shards, {total_rows:,} rows")
+    return manifest
+
+
 def create_model_data(
     club_or_tournament='club',
     *,
     chunk_years=True,
     start_year=None,
     end_year=None,
-    merge_shards=True,
+    merge_shards=False,
     keep_shards=False,
     months_per_chunk=1,
 ):
@@ -512,6 +563,7 @@ def create_model_data(
         'EV_Max_Col_Declarer':pl.String,
         'EV_Score_Col_Declarer':pl.Float32,
         'EV_Score_Declarer':pl.Float32,
+        'EV_Score_(NS|EW)':pl.Float32,
         'MP_DD_Score_(NS|EW|Declarer)':pl.Int16,
         'MP_DD_Score_Max_(NS|EW)':pl.Int16,
         'MP_Par_Declarer':pl.Int16,
@@ -632,6 +684,7 @@ def create_model_data(
         # EV columns
         'EV_Pct_Max_(NS|EW)':pl.Float32,
         'EV_Pct_Max_Diff_(NS|EW)':pl.Float32,
+        'EV_Score_Pct_(NS|EW)':pl.Float32,
         # no matches: 'EV_Par_Pct_Diff_(NS|EW)':pl.Float32,
         # no matches: 'EV_Par_Pct_Max_Diff_(NS|EW)':pl.Float32,
         'EV_Max_Diff_(NS|EW)':pl.Float32,
@@ -640,6 +693,7 @@ def create_model_data(
         'MP_(NS|EW)':pl.Float32,
         'MP_DD_Score_[1-7][CDHSN]_([NESW]|NS|EW)':pl.Float32,
         'MP_EV_(NS|EW)_[NESW]_[CDHSN]_[1-7]_(NV|V)':pl.Float32,
+        'MP_EV_Score_(NS|EW)':pl.Float32,
         'MP_Par_(NS|EW)':pl.Float32,
         #'MP_DD_Score_(NS|EW)':pl.Float32,
         # no matches: 'MP_DD_Score_Pct_(NS|EW)':pl.Float32,
@@ -1037,6 +1091,12 @@ def create_model_data(
         del hrs_df
         gc.collect()
 
+        # Manifest: lets consumers (acbl_prediction_data.py etc.) verify the
+        # shard set is complete before scanning the glob. Row counts come
+        # from parquet footers only (cheap), so this also covers shards that
+        # were skip-resumed from an earlier run.
+        _write_shard_manifest(shard_dir, shards, label=club_or_tournament)
+
         if merge_shards:
             non_empty_shards = [s for s in shards if s.stat().st_size > 0]
             if not non_empty_shards:
@@ -1052,12 +1112,16 @@ def create_model_data(
                     for s in shards:
                         if s.exists():
                             s.unlink()
+                    manifest = shard_dir.joinpath('manifest.json')
+                    if manifest.exists():
+                        manifest.unlink()
                     try:
                         shard_dir.rmdir()
                     except OSError:
                         pass  # non-empty (e.g. user added files) -- leave it
         else:
-            print(f"--no-merge-shards: shards retained at {shard_dir}")
+            print(f"Shards + manifest retained at {shard_dir} "
+                  f"(default; pass --merge-shards for a single file)")
 
     # Defensive cleanup if not already done by the chunked path.
     try:
@@ -1067,10 +1131,12 @@ def create_model_data(
     gc.collect()
 
     # Step E: cheap post-write summary (lazy, never materializes data).
-    # Only scan when the canonical merged file actually exists and is
-    # non-empty -- under --no-merge-shards we never produce it, and a stale
-    # 0-byte file would have been cleaned up above.
-    if (
+    # With the default shard output, summarize from the manifest; only scan
+    # the canonical merged file when --merge-shards actually produced one.
+    shard_manifest = acblPath.joinpath(
+        f'shards_{club_or_tournament}_model_data', 'manifest.json'
+    )
+    if (merge_shards or not chunk_years) and (
         acbl_club_model_data_file.exists()
         and acbl_club_model_data_file.stat().st_size > 0
     ):
@@ -1078,8 +1144,14 @@ def create_model_data(
         n_rows = pl.scan_parquet(acbl_club_model_data_file).select(pl.len()).collect()[0, 0]
         n_cols_out = len(pl.read_parquet_schema(acbl_club_model_data_file))
         print(f"Saved {acbl_club_model_data_filename}: shape:({n_rows:,}, {n_cols_out}), size:{out_size}")
+    elif shard_manifest.exists():
+        import json
+        m = json.loads(shard_manifest.read_text(encoding='utf-8'))
+        total_bytes = sum(e['bytes'] for e in m['shards'])
+        print(f"Saved {m['shard_count']} shards in {shard_manifest.parent.name}: "
+              f"rows={m['total_rows']:,}, size={total_bytes:,}")
     else:
-        print(f"(no canonical merged file produced; check shard dir)")
+        print(f"(no merged file or shard manifest produced; check shard dir)")
 
     return None  # streaming mode -- no materialized DataFrame to return
 
@@ -1108,13 +1180,16 @@ def _parse_club_tournament_args():
                              "for club, ~38 GB peak RSS). Increase to 3 or 12 "
                              "for tournament where rows/month are smaller.")
     parser.add_argument("--merge-shards", dest="merge_shards",
-                        action="store_true", default=True,
-                        help="After per-year sinks, concat shards into the "
-                             "canonical *_model_data.parquet (default).")
+                        action="store_true", default=False,
+                        help="After per-window sinks, concat shards into a "
+                             "single *_model_data.parquet. Very slow for the "
+                             "6,778-col schema (~12 h for club) and downstream "
+                             "reads get slower, not faster -- only use if a "
+                             "single file is required.")
     parser.add_argument("--no-merge-shards", dest="merge_shards",
                         action="store_false",
-                        help="Skip the merge step. Useful when downstream "
-                             "consumers can scan the shard directory.")
+                        help="Skip the merge step; keep shards + manifest.json "
+                             "for consumers to scan (default).")
     parser.add_argument("--keep-shards", action="store_true", default=False,
                         help="With --merge-shards, retain per-year shards "
                              "instead of deleting them after the merge.")

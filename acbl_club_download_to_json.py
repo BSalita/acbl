@@ -16,13 +16,18 @@ rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')
 
 # Persistent browser profile. Cloudflare's managed challenge on my.acbl.org can
-# only be cleared by a real, non-headless Chrome, so we run headed (window moved
-# off-screen to stay unobtrusive). Keeping a real-Chrome user-data-dir lets the
-# cf_clearance cookie survive between runs, so the challenge is rarely shown.
+# only be cleared by a real, non-headless Chrome. Keeping a real-Chrome
+# user-data-dir lets the cf_clearance cookie survive between runs.
+# IMPORTANT: the window must stay ON-SCREEN while a challenge is active —
+# Turnstile / managed challenges often never complete when the window is
+# minimized or moved off-screen (the previous -32000,-32000 setup hung forever).
 PROFILE_DIR = acblPath.joinpath('playwright_profile')
 
-# Window position used to keep the headed Chrome window off-screen.
-_OFFSCREEN_POS = '-32000,-32000'
+# Init script applied to every new document. Playwright sets navigator.webdriver
+# which Cloudflare treats as an automation hard-fail.
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+"""
 
 try:
     from playwright.sync_api import sync_playwright
@@ -42,40 +47,131 @@ def _launch_browser_context(p):
 
     Notes:
       - channel="chrome" uses the locally installed Google Chrome (genuine TLS
-        + JS fingerprint). Cloudflare's managed challenge cannot be cleared by
-        headless Chrome (it advertises HeadlessChrome and is blocked), so we run
-        headed but push the window off-screen so it is not intrusive.
+        + JS fingerprint). Headless Chrome is blocked; we run headed and keep
+        the window on-screen so Turnstile can complete (auto or via a click).
+      - ignore_default_args removes Playwright's --enable-automation flag.
       - We deliberately do NOT override the user agent: a real Chrome UA paired
-        with mismatched client hints is itself a bot signal. Let Chrome present
-        its genuine UA/client hints.
-      - launch_persistent_context returns a BrowserContext directly (there is no
-        separate Browser object); close the context to shut the browser down.
-        The persistent user-data-dir also keeps the cf_clearance cookie warm.
+        with mismatched client hints is itself a bot signal.
+      - launch_persistent_context returns a BrowserContext directly; close the
+        context to shut the browser down. The persistent user-data-dir keeps
+        the cf_clearance cookie warm across runs.
     """
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     return p.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         channel="chrome",
         headless=False,
+        # Playwright defaults chromium_sandbox=False, which injects
+        # --no-sandbox; system Chrome then shows an "unsupported command
+        # line flag" infobar that itself looks bot-like to Cloudflare.
+        chromium_sandbox=True,
+        ignore_default_args=["--enable-automation", "--no-sandbox"],
+        # Keep args minimal: recent system Chrome flags --disable-blink-features
+        # (and --no-sandbox) as "unsupported" infobars, which also hurt CF scores.
+        # Stealth is handled via ignore_default_args + _STEALTH_INIT_SCRIPT.
         args=[
-            '--disable-blink-features=AutomationControlled',
             '--no-first-run',
             '--no-default-browser-check',
-            f'--window-position={_OFFSCREEN_POS}',
-            '--window-size=1920,1080',
-            '--start-minimized',
+            '--window-position=80,80',
+            '--window-size=1280,900',
         ],
-        viewport={'width': 1920, 'height': 1080},
+        viewport={'width': 1280, 'height': 900},
     )
 
 
-def _wait_through_cloudflare(page, timeout_ms: int = 120000) -> bool:
+def _page_has_acbl_payload(content: str) -> bool:
+    """True when the HTML looks like a real ACBL results page, not a CF interstitial."""
+    if not content:
+        return False
+    # Details pages embed session JSON; list pages expose the Vue/app shell + links.
+    return (
+        "var data =" in content
+        or ('id="app"' in content and "/club-results/" in content)
+        or 'href="/club-results/details/' in content
+    )
+
+
+def _is_cloudflare_challenge(page, content: str) -> bool:
+    """
+    Detect an active Cloudflare interstitial.
+
+    Do NOT treat bare 'cf-chl' / 'challenge-platform' substrings as sufficient
+    once real ACBL payload is present — cleared pages can still mention those
+    strings in leftover scripts and would otherwise loop forever.
+    """
+    if _page_has_acbl_payload(content):
+        return False
+    title = ""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        pass
+    if any(s in title for s in ("just a moment", "checking your browser", "attention required", "verify you are human")):
+        return True
+    if not content:
+        return True
+    markers = (
+        "cf-turnstile",
+        "challenge-platform",
+        "cf-chl-bypass",
+        "cdn-cgi/challenge-platform",
+        "checking if the site connection is secure",
+    )
+    return any(m in content for m in markers)
+
+
+def _bring_page_window_forward(page) -> None:
+    """Best-effort: put the Chrome window on-screen so Turnstile can be solved."""
+    try:
+        page.evaluate(
+            """() => {
+                try { window.moveTo(80, 80); } catch (e) {}
+                try { window.resizeTo(1280, 900); } catch (e) {}
+                try { window.focus(); } catch (e) {}
+            }"""
+        )
+    except Exception:
+        pass
+    try:
+        # CDP Browser.bringToFront is more reliable than window.focus alone.
+        session = page.context.new_cdp_session(page)
+        session.send("Browser.bringToFront")
+    except Exception:
+        pass
+
+
+def _try_click_turnstile(page) -> None:
+    """Best-effort click on a visible Turnstile checkbox / widget body."""
+    try:
+        for frame in page.frames:
+            url = (frame.url or "").lower()
+            if "turnstile" not in url and "challenges.cloudflare.com" not in url:
+                continue
+            for sel in ("input[type='checkbox']", "body"):
+                try:
+                    loc = frame.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.click(timeout=1500, force=True)
+                        return
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        page.frame_locator(
+            "iframe[src*='turnstile'], iframe[src*='challenges.cloudflare']"
+        ).locator("body").first.click(timeout=1500, force=True)
+    except Exception:
+        pass
+
+
+def _wait_through_cloudflare(page, timeout_ms: int = 180000) -> bool:
     """
     After navigating, wait out a Cloudflare managed/JS challenge interstitial.
 
     Real Chrome usually clears the challenge automatically within a few seconds.
-    If a visible (headed) window prompts for an interactive Turnstile click, the
-    user has up to timeout_ms to solve it.
+    Interactive Turnstile needs a visible window (and sometimes a human click);
+    we bring the window forward and print instructions.
 
     Returns:
         True once real page content is loaded.
@@ -85,41 +181,56 @@ def _wait_through_cloudflare(page, timeout_ms: int = 120000) -> bool:
     """
     deadline = time.time() + timeout_ms / 1000.0
     announced = False
+    last_status = 0.0
+    clicked = False
     while time.time() < deadline:
-        title = ""
         content = ""
-        try:
-            title = (page.title() or "").lower()
-        except Exception:
-            pass
         try:
             content = page.content()
         except Exception:
             pass
 
-        challenged = (
-            "just a moment" in title
-            or "checking your browser" in title
-            or "cf-chl" in content
-            or "challenge-platform" in content
-        )
-
-        if content and not challenged:
-            # Cloudflare often reloads the page right after the challenge
-            # clears; let that settle so the caller reads the real content.
+        if content and not _is_cloudflare_challenge(page, content):
             try:
-                page.wait_for_load_state('networkidle', timeout=10000)
+                page.wait_for_load_state('domcontentloaded', timeout=10000)
             except Exception:
                 pass
+            if announced:
+                print("  Cloudflare challenge cleared.")
             return True
 
         if not announced:
             print("  Cloudflare challenge detected; waiting for it to clear...")
+            print("  -> Chrome window should be visible. If you see 'Verify you are human', click it.")
+            print(f"  -> Profile: {PROFILE_DIR}")
+            print("  -> If this hangs every run, delete that profile folder and retry.")
+            _bring_page_window_forward(page)
             announced = True
+
+        if not clicked:
+            _try_click_turnstile(page)
+            clicked = True
+
+        now = time.time()
+        if now - last_status >= 15:
+            title = ""
+            try:
+                title = page.title() or ""
+            except Exception:
+                pass
+            remaining = int(deadline - now)
+            print(f"  ... still waiting ({remaining}s left); title={title!r}")
+            _bring_page_window_forward(page)
+            _try_click_turnstile(page)
+            last_status = now
 
         page.wait_for_timeout(1000)
 
-    raise Forbidden403Error("Cloudflare challenge did not clear within timeout")
+    raise Forbidden403Error(
+        "Cloudflare challenge did not clear within timeout. "
+        "Complete the check in the Chrome window, or delete "
+        f"{PROFILE_DIR} and retry."
+    )
 
 
 # --- Shared browser singleton -------------------------------------------------
@@ -141,7 +252,23 @@ def _get_browser_page():
         return _PAGE
     _PW = sync_playwright().start()
     _CONTEXT = _launch_browser_context(_PW)
-    _PAGE = _CONTEXT.new_page()
+    try:
+        _CONTEXT.add_init_script(_STEALTH_INIT_SCRIPT)
+    except Exception:
+        pass
+    # Reuse an existing tab from the persistent profile when present; otherwise
+    # open one. Warm the origin so cf_clearance can be established before the
+    # first details URL (helps when the profile is cold).
+    _PAGE = _CONTEXT.pages[0] if _CONTEXT.pages else _CONTEXT.new_page()
+    try:
+        if "my.acbl.org" not in (_PAGE.url or ""):
+            print("  Warming Chrome session at https://my.acbl.org/ ...")
+            _PAGE.goto("https://my.acbl.org/", wait_until="domcontentloaded", timeout=60000)
+            _wait_through_cloudflare(_PAGE)
+    except Forbidden403Error:
+        raise
+    except Exception as e:
+        print(f"  Warning: session warm-up failed ({e}); continuing anyway")
     return _PAGE
 
 
