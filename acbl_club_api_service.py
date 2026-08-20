@@ -80,6 +80,10 @@ PARQUET_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_PARQUET_DIR", "e:/bridge/data/acbl/club_results_parquet")
 )
 
+# Ensure the cache dir exists up front: CACHE_ROOTS is fixed at import, and a
+# missing dir would otherwise be excluded from reads even after writes create it.
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 CACHE_ROOTS: List[pathlib.Path] = [
     root for root in (CACHE_DIR, ARCHIVE_CACHE_DIR) if root.is_dir()
 ] or [CACHE_DIR]
