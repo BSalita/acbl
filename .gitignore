@@ -17,5 +17,11 @@ __pycache__/
 logs/
 validation_output/
 
+# Stage-1b parquets staged for OneDrive sync to production (see u.bat);
+# 2.7 GB of data, never committed
+club_results_parquet/
+# Local session-details cache written by acbl_club_api_service.py
+club-results/
+
 # Retired scripts (pre-version-control archive)
 old/

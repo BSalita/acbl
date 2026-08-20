@@ -17,6 +17,9 @@ urllib3
 playwright
 endplay
 duckdb
+fastapi
+uvicorn
+mcp
 matplotlib
 requests
 seaborn
