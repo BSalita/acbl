@@ -22,6 +22,8 @@ validation_output/
 club_results_parquet/
 # Local session-details cache written by acbl_club_api_service.py
 club-results/
+# Recent archive slice staged for OneDrive sync to production (see u.bat)
+club-results-recent/
 
 # Retired scripts (pre-version-control archive)
 old/

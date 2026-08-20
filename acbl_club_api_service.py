@@ -83,7 +83,14 @@ PARQUET_DIR = pathlib.Path(
 CACHE_ROOTS: List[pathlib.Path] = [
     root for root in (CACHE_DIR, ARCHIVE_CACHE_DIR) if root.is_dir()
 ] or [CACHE_DIR]
-WRITE_CACHE_DIR = ARCHIVE_CACHE_DIR if ARCHIVE_CACHE_DIR.is_dir() else CACHE_DIR
+# Write scrapes into the archive so stage 1a skips them -- but only when it is
+# writable. In production the archive is a read-only mount of the OneDrive
+# "recent slice" (see src/acbl/u.bat), so writes go to the local cache instead.
+WRITE_CACHE_DIR = (
+    ARCHIVE_CACHE_DIR
+    if ARCHIVE_CACHE_DIR.is_dir() and os.access(str(ARCHIVE_CACHE_DIR), os.W_OK)
+    else CACHE_DIR
+)
 
 _PLAYER_INFO_CANDIDATES = (
     os.environ.get("ACBL_PLAYER_INFO_PARQUET"),
