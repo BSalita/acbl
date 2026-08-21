@@ -8,6 +8,7 @@ os._exit). Playwright helpers come from mlBridge.mlBridgeAcblLib.
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -74,11 +75,26 @@ CACHE_DIR = _default_cache_dir()
 ARCHIVE_CACHE_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_ARCHIVE_DIR", "e:/bridge/data/acbl/club-results")
 )
-# Stage 1b outputs (acbl_club_json_to_sql.py): normalized per-table parquets.
-# Nine core tables cover listings/lookups plus complete historical postmortems.
+# Stage 1b outputs (acbl_club_json_to_sql.py): five normalized relationship
+# tables support listings/lookups. Historical postmortems use the cleaned and
+# fully augmented Stage 3c monolith instead of rebuilding from raw entities.
 PARQUET_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_PARQUET_DIR", "e:/bridge/data/acbl/club_results_parquet")
 )
+_AUGMENTED_FILENAME = "acbl_club_board_results_augmented.parquet"
+
+
+def _default_augmented_parquet_file() -> pathlib.Path:
+    env = os.environ.get("ACBL_CLUB_AUGMENTED_PARQUET")
+    if env:
+        return pathlib.Path(env)
+    deployed = PARQUET_DIR / _AUGMENTED_FILENAME
+    if deployed.is_file():
+        return deployed
+    return pathlib.Path("e:/bridge/data/acbl") / _AUGMENTED_FILENAME
+
+
+AUGMENTED_PARQUET_FILE = _default_augmented_parquet_file()
 
 # Ensure the cache dir exists up front: CACHE_ROOTS is fixed at import, and a
 # missing dir would otherwise be excluded from reads even after writes create it.
@@ -106,6 +122,9 @@ _SCRAPE_LOCK = threading.Lock()
 _SESSION_DF_CACHE: Dict[Tuple[str, float], Dict[str, pl.DataFrame]] = {}
 _SESSION_DF_LOCK = threading.Lock()
 _SESSION_DF_MAX = 8
+_AUGMENTED_SESSION_CACHE: Dict[Tuple[str, float], bytes] = {}
+_AUGMENTED_SESSION_LOCK = threading.Lock()
+_AUGMENTED_SESSION_MAX = 8
 
 
 class ClubApiError(Exception):
@@ -1080,6 +1099,63 @@ def session_raw_with_source(
     else:
         source = "cached downloaded JSON data file"
     return data, source
+
+
+def session_augmented_parquet(
+    session_id: str,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Return one historical postmortem filtered from the Stage 3c monolith."""
+    path = AUGMENTED_PARQUET_FILE
+    if not path.is_file():
+        raise ClubApiError(
+            "Historical augmented postmortem data is not deployed",
+            status_code=404,
+            hint=(
+                f"Deploy {_AUGMENTED_FILENAME}; recent sessions can still use "
+                "the JSON/live augmentation fallback."
+            ),
+        )
+
+    sid = str(session_id)
+    key = (sid, path.stat().st_mtime)
+    with _AUGMENTED_SESSION_LOCK:
+        cached = _AUGMENTED_SESSION_CACHE.get(key)
+    if cached is None:
+        lazy = pl.scan_parquet(path)
+        if "event_id" not in lazy.collect_schema().names():
+            raise ClubApiError(
+                f"{path.name} does not contain event_id",
+                status_code=500,
+            )
+        frame = _collect_retry(
+            lazy.filter(pl.col("event_id").cast(pl.Utf8) == sid)
+        )
+        if frame is None:
+            raise ClubApiError(
+                f"Could not read historical postmortem {session_id}",
+                status_code=503,
+                hint="The augmented parquet may be updating; retry shortly.",
+            )
+        if frame.is_empty():
+            raise ClubApiError(
+                f"Session {session_id} is newer than or absent from the augmented parquet",
+                status_code=404,
+                hint="Use the session-frames endpoint to build it from recent JSON/live data.",
+            )
+        output = io.BytesIO()
+        frame.write_parquet(output, compression="zstd")
+        cached = output.getvalue()
+        with _AUGMENTED_SESSION_LOCK:
+            if len(_AUGMENTED_SESSION_CACHE) >= _AUGMENTED_SESSION_MAX:
+                _AUGMENTED_SESSION_CACHE.pop(next(iter(_AUGMENTED_SESSION_CACHE)))
+            _AUGMENTED_SESSION_CACHE[key] = cached
+
+    return cached, {
+        "source": "historical augmented parquet",
+        "source_file": path.name,
+        "session_id": sid,
+        "fetched_at": _file_mtime_iso(path),
+    }
 
 
 def _standings_df(dfs: Dict[str, Any]) -> pl.DataFrame:

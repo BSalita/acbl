@@ -140,6 +140,23 @@ def get_session_frames(session_id: str, refresh: bool = Query(False)) -> dict:
     return svc.session_frames_payload(session_id, refresh=refresh)
 
 
+@app.get("/sessions/{session_id}/postmortem.parquet")
+def get_session_postmortem_parquet(session_id: str) -> Response:
+    """Pre-augmented historical postmortem as a compact Parquet response."""
+    payload, meta = svc.session_augmented_parquet(session_id)
+    return Response(
+        content=payload,
+        media_type="application/vnd.apache.parquet",
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="acbl-postmortem-{session_id}.parquet"'
+            ),
+            "X-ACBL-Data-Source": str(meta["source"]),
+            "X-ACBL-Data-Updated": str(meta["fetched_at"] or ""),
+        },
+    )
+
+
 @app.get("/sessions/{session_id}/sql")
 def get_session_sql(
     session_id: str,
