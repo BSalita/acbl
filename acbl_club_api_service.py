@@ -74,8 +74,8 @@ CACHE_DIR = _default_cache_dir()
 ARCHIVE_CACHE_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_ARCHIVE_DIR", "e:/bridge/data/acbl/club-results")
 )
-# Stage 1b outputs (acbl_club_json_to_sql.py): normalized per-table parquets
-# (events, players, pair_summaries, sections, sessions) covering the full archive.
+# Stage 1b outputs (acbl_club_json_to_sql.py): normalized per-table parquets.
+# Nine core tables cover listings/lookups plus complete historical postmortems.
 PARQUET_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_PARQUET_DIR", "e:/bridge/data/acbl/club_results_parquet")
 )
@@ -553,6 +553,7 @@ def parse_player_games_html(html: str, player_id: str) -> List[Dict[str, Any]]:
                 "score": extra.get("score"),
                 "details_url": detail_url,
                 "player_id": str(player_id),
+                "listing_source": "downloaded from ACBL web",
             }
         )
     return rows
@@ -631,6 +632,11 @@ def _games_from_cached_details(club_id: str) -> List[Dict[str, Any]]:
                     "club_id": str(data.get("club_id_number") or club_id),
                     "club_name": data.get("club_name"),
                     "details_url": f"{ACBL_ORIGIN}/club-results/details/{session_id}",
+                    "listing_source": (
+                        "archive JSON data file"
+                        if root == ARCHIVE_CACHE_DIR
+                        else "cached downloaded JSON data file"
+                    ),
                 }
             )
     rows.sort(key=_date_sort_key, reverse=True)
@@ -667,6 +673,7 @@ def _player_games_from_cached_details(player_id: str) -> List[Dict[str, Any]]:
                 "score": None,
                 "details_url": f"{ACBL_ORIGIN}/club-results/details/{session_id}",
                 "player_id": pid,
+                "listing_source": "cached downloaded JSON data file",
             }
         )
     rows.sort(key=_date_sort_key, reverse=True)
@@ -740,6 +747,7 @@ def _club_games_from_parquet(club_id: str) -> List[Dict[str, Any]]:
             "event_type": rec["type"],
             "board_scoring_method": rec["board_scoring_method"],
             "details_url": f"{ACBL_ORIGIN}/club-results/details/{rec['id']}",
+            "listing_source": "historical parquet",
         }
         for rec in df.to_dicts()
         if rec.get("id")
@@ -790,11 +798,15 @@ def club_games(
             payload = _load_json(games_cache)
             info = payload.get("info") or info
             rows = payload.get("games") or []
+            for row in rows:
+                row["listing_source"] = "cached game-list JSON (originally web)"
             complete = bool(payload.get("complete"))
             fetched_at = _file_mtime_iso(games_cache)
         elif html_cache.is_file() and html_cache.stat().st_size > 2048:
             # Legacy HTML cache; completeness unknown, so treat as partial.
             info, rows = parse_club_page(html_cache.read_text(encoding="utf-8"), cid)
+            for row in rows:
+                row["listing_source"] = "cached club-page HTML"
             fetched_at = _file_mtime_iso(html_cache)
         else:
             rows = _games_from_cached_details(cid)
@@ -820,6 +832,8 @@ def club_games(
             html_cache.parent.mkdir(parents=True, exist_ok=True)
             html_cache.write_text(html, encoding="utf-8")
             info, live_rows = parse_club_page(html, cid)
+            for row in live_rows:
+                row["listing_source"] = "downloaded from ACBL web"
             _save_json(games_cache, {"info": info, "games": live_rows, "complete": live_complete})
             # Parquet history extends a limit-truncated live listing.
             rows = _merge_game_rows(live_rows, parquet_rows)
@@ -924,6 +938,7 @@ def _player_games_from_parquet(player_id: str) -> List[Dict[str, Any]]:
                 "score": f"{pct}%" if pct not in (None, "") else None,
                 "details_url": f"{ACBL_ORIGIN}/club-results/details/{eid}",
                 "player_id": str(player_id),
+                "listing_source": "historical parquet",
             }
         )
     rows.sort(key=lambda r: int(r["session_id"]), reverse=True)
@@ -962,6 +977,8 @@ def player_games(
             else:
                 # Legacy cache: bare list, completeness unknown.
                 rows = payload or []
+            for row in rows:
+                row["listing_source"] = "cached game-list JSON (originally web)"
             fetched_at = _file_mtime_iso(cache_file)
         if not rows:
             rows = _player_games_from_cached_details(pid)
@@ -1051,6 +1068,20 @@ def session_raw(session_id: str, refresh: bool = False) -> Dict[str, Any]:
     return data
 
 
+def session_raw_with_source(
+    session_id: str, refresh: bool = False
+) -> Tuple[Dict[str, Any], str]:
+    """Raw session JSON plus a human-readable provenance label."""
+    data, cached, path = _fetch_session_json(session_id, refresh=refresh)
+    if not cached:
+        source = "downloaded from ACBL web"
+    elif path.is_relative_to(ARCHIVE_CACHE_DIR):
+        source = "archive JSON data file"
+    else:
+        source = "cached downloaded JSON data file"
+    return data, source
+
+
 def _standings_df(dfs: Dict[str, Any]) -> pl.DataFrame:
     pairs = _as_pl(dfs["pair_summaries"])
     players = _as_pl(dfs["players"])
@@ -1093,6 +1124,146 @@ _NESTED_SESSION_TABLES = {
     "players": ["sessions", "sections", "pair_summaries", "players"],
     "board_results": ["sessions", "sections", "boards", "board_results"],
 }
+
+_PARQUET_SESSION_TABLES = (
+    "events",
+    "club",
+    "sessions",
+    "sections",
+    "boards",
+    "board_results",
+    "pair_summaries",
+    "players",
+    "hand_records",
+)
+
+# Stage-1b stores every value as Utf8. Restore only the scalar types used by
+# create_club_dfs/merge_clean_augment_club_dfs so joins behave like raw JSON.
+_PARQUET_INT_COLUMNS = {
+    "events": {"id", "club_id_number"},
+    "club": {"id"},
+    "sessions": {"id", "event_id", "number"},
+    "sections": {"id", "session_id"},
+    "boards": {"id", "section_id", "board_number"},
+    "board_results": {
+        "id", "board_id", "round_number", "table_number", "ns_pair", "ew_pair"
+    },
+    "pair_summaries": {"id", "section_id", "pair_number"},
+    "players": {"id", "pair_summary_id"},
+    "hand_records": {"id", "board", "hand_record_set_id"},
+}
+_PARQUET_FLOAT_COLUMNS = {
+    "events": {"tb_count"},
+    "board_results": {"ew_match_points", "ns_match_points"},
+    "pair_summaries": {
+        "score", "percentage", "adjustment", "handicap", "raw_score"
+    },
+    "players": {"mp_total"},
+}
+
+
+def _parquet_session_cache_key(session_id: str) -> Optional[Tuple[str, float]]:
+    files = [_parquet_file(name) for name in _PARQUET_SESSION_TABLES]
+    if any(path is None for path in files):
+        return None
+    return (
+        f"parquet:{session_id}",
+        max(path.stat().st_mtime for path in files if path is not None),
+    )
+
+
+def _restore_parquet_types(table: str, frame: pl.DataFrame) -> pl.DataFrame:
+    expressions = []
+    for col in _PARQUET_INT_COLUMNS.get(table, set()):
+        if col in frame.columns:
+            expressions.append(pl.col(col).cast(pl.Int64, strict=False))
+    for col in _PARQUET_FLOAT_COLUMNS.get(table, set()):
+        if col in frame.columns:
+            expressions.append(pl.col(col).cast(pl.Float64, strict=False))
+    return frame.with_columns(expressions) if expressions else frame
+
+
+def _collect_parquet_rows(
+    table: str, column: str, values: Iterable[Any]
+) -> Optional[pl.DataFrame]:
+    lazy = _parquet_scan(table)
+    wanted = [str(value) for value in values if value not in (None, "")]
+    if lazy is None or not wanted or column not in lazy.collect_schema().names():
+        return None
+    frame = _collect_retry(
+        lazy.filter(pl.col(column).cast(pl.Utf8).is_in(wanted))
+    )
+    return _restore_parquet_types(table, frame) if frame is not None else None
+
+
+def session_frames_from_parquet(
+    session_id: str,
+) -> Optional[Dict[str, pl.DataFrame]]:
+    """Build create_club_dfs-compatible frames from normalized stage-1b data.
+
+    ``session_id`` is the details-page/event id. Predicate pushdown keeps the
+    multi-GB board and hand tables out of memory except for this one event.
+    """
+    if any(_parquet_file(name) is None for name in _PARQUET_SESSION_TABLES):
+        return None
+    sid = str(session_id)
+    event = _collect_parquet_rows("events", "id", [sid])
+    sessions = _collect_parquet_rows("sessions", "event_id", [sid])
+    if event is None or event.is_empty() or sessions is None or sessions.is_empty():
+        return None
+
+    session_ids = sessions.get_column("id").drop_nulls().to_list()
+    sections = _collect_parquet_rows("sections", "session_id", session_ids)
+    if sections is None or sections.is_empty():
+        return None
+    section_ids = sections.get_column("id").drop_nulls().to_list()
+
+    boards = _collect_parquet_rows("boards", "section_id", section_ids)
+    pairs = _collect_parquet_rows("pair_summaries", "section_id", section_ids)
+    if boards is None or boards.is_empty() or pairs is None or pairs.is_empty():
+        return None
+    board_ids = boards.get_column("id").drop_nulls().to_list()
+    pair_ids = pairs.get_column("id").drop_nulls().to_list()
+    board_results = _collect_parquet_rows("board_results", "board_id", board_ids)
+    players = _collect_parquet_rows("players", "pair_summary_id", pair_ids)
+
+    hand_set_ids = [
+        value
+        for value in sessions.get_column("hand_record_id").drop_nulls().to_list()
+        if str(value).isdigit()
+    ]
+    hand_records = _collect_parquet_rows(
+        "hand_records", "hand_record_set_id", hand_set_ids
+    )
+    club_ids = event.get_column("club_id_number").drop_nulls().to_list()
+    club = _collect_parquet_rows("club", "id", club_ids)
+    if any(
+        frame is None or frame.is_empty()
+        for frame in (board_results, players, hand_records, club)
+    ):
+        return None
+
+    # create_club_dfs flattens hand_records.points into these four columns.
+    # They are unused by the merge, but its compatibility drop expects them.
+    if "points" in hand_records.columns:
+        hand_records = hand_records.drop("points")
+    hand_records = hand_records.with_columns(
+        pl.lit(None, dtype=pl.Utf8).alias(f"points.{direction}")
+        for direction in ("N", "E", "S", "W")
+    )
+
+    return {
+        "event": event,
+        "club": club,
+        "sessions": sessions.sort("id"),
+        "sections": sections.sort("id"),
+        "boards": boards.sort(["section_id", "board_number"]),
+        "board_results": board_results.sort(["board_id", "id"]),
+        "pair_summaries": pairs.sort(["section_id", "id"]),
+        "players": players.sort(["pair_summary_id", "id"]),
+        "hand_records": hand_records.sort(["hand_record_set_id", "board"]),
+        "strat_place": pl.DataFrame(),
+    }
 
 
 def _drop_nested_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1150,6 +1321,41 @@ def session_frames_from_json(data: Dict[str, Any]) -> Dict[str, pl.DataFrame]:
 
 
 def session_dataframes(session_id: str, refresh: bool = False) -> Tuple[Dict[str, pl.DataFrame], Dict[str, Any]]:
+    if not refresh:
+        parquet_key = _parquet_session_cache_key(str(session_id))
+        with _SESSION_DF_LOCK:
+            parquet_dfs = (
+                _SESSION_DF_CACHE.get(parquet_key)
+                if parquet_key is not None
+                else None
+            )
+        if parquet_dfs is None:
+            parquet_dfs = session_frames_from_parquet(session_id)
+            if parquet_dfs is not None:
+                try:
+                    parquet_dfs["standings"] = _standings_df(parquet_dfs)
+                except Exception:
+                    pass
+                if parquet_key is not None:
+                    with _SESSION_DF_LOCK:
+                        if len(_SESSION_DF_CACHE) >= _SESSION_DF_MAX:
+                            _SESSION_DF_CACHE.pop(next(iter(_SESSION_DF_CACHE)))
+                        _SESSION_DF_CACHE[parquet_key] = parquet_dfs
+        if parquet_dfs is not None:
+            event = parquet_dfs["event"].row(0, named=True)
+            return parquet_dfs, {
+                "source_url": f"{ACBL_ORIGIN}/club-results/details/{session_id}",
+                "source": "historical parquet",
+                "cached": True,
+                "fetched_at": _parquet_updated_iso(),
+                "session_id": str(session_id),
+                "club_id": str(event.get("club_id_number") or ""),
+                "club_name": event.get("club_name"),
+                "event_name": event.get("name"),
+                "start_date": event.get("start_date"),
+                "cache_file": None,
+            }
+
     data, cached, path = _fetch_session_json(session_id, refresh=refresh)
     mtime = path.stat().st_mtime if path.exists() else 0.0
     key = (str(path), mtime)
@@ -1193,6 +1399,21 @@ def session_dataframes(session_id: str, refresh: bool = False) -> Tuple[Dict[str
         "cache_file": str(path),
     }
     return dfs, meta
+
+
+def session_frames_payload(session_id: str, refresh: bool = False) -> Dict[str, Any]:
+    """JSON transport for create_club_dfs-compatible session frames."""
+    dfs, meta = session_dataframes(session_id, refresh=refresh)
+    return {
+        "tables": {
+            name: [
+                {key: _jsonable(value) for key, value in row.items()}
+                for row in frame.to_dicts()
+            ]
+            for name, frame in dfs.items()
+        },
+        "meta": _jsonable(meta),
+    }
 
 
 def session_tables(session_id: str, refresh: bool = False) -> Dict[str, Any]:

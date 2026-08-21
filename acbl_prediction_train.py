@@ -494,7 +494,11 @@ def train_predictions(club_or_tournament, targets: Optional[List[str]] = None,
         optimal_lr = 1e-3 # reduce LR to improve stability
         optimal_weight_decay = 1e-4 #1e-5
         optimal_bs = 8192
-        optimal_shard_rows_count = 2_000_000
+        # 2M rows/shard OOM'd club Declarer_Direction on 2026-08-19 (44.9 GiB
+        # per-shard numpy alloc on top of the ~1.5 TB materialized df exceeded
+        # the 2.27 TB commit limit after the L: pagefile was removed). 1M rows
+        # halves the transient; total shard bytes on disk are unchanged.
+        optimal_shard_rows_count = 1_000_000
         optimal_use_amp =  False # False
         optimal_y_range = None
         # Early-stopping patience (epochs without val_loss improvement). 0 disables.

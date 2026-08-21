@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -125,9 +125,19 @@ def get_session_table(
 
 
 @app.get("/sessions/{session_id}/raw")
-def get_session_raw(session_id: str, refresh: bool = Query(False)) -> dict:
+def get_session_raw(
+    session_id: str, response: Response, refresh: bool = Query(False)
+) -> dict:
     """Verbatim details JSON (nested), for the postmortem augmentation pipeline."""
-    return svc.session_raw(session_id, refresh=refresh)
+    data, source = svc.session_raw_with_source(session_id, refresh=refresh)
+    response.headers["X-ACBL-Data-Source"] = source
+    return data
+
+
+@app.get("/sessions/{session_id}/frames")
+def get_session_frames(session_id: str, refresh: bool = Query(False)) -> dict:
+    """Flat session tables for postmortem processing, including parquet fallback."""
+    return svc.session_frames_payload(session_id, refresh=refresh)
 
 
 @app.get("/sessions/{session_id}/sql")
