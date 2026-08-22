@@ -64,7 +64,7 @@ async def health(request: Request) -> JSONResponse:
 @mcp.tool()
 def acbl_tournament_dataset_info() -> Dict[str, Any]:
     """Tournament parquet, API cache, and live-source availability."""
-    return _api_get("/health")
+    return _api_get("/tournaments/info")
 
 
 @mcp.tool()

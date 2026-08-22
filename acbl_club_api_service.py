@@ -169,6 +169,9 @@ _AUGMENTED_SESSION_CACHE: Dict[Tuple[str, float], bytes] = {}
 _AUGMENTED_SESSION_LOCK = threading.Lock()
 _AUGMENTED_SESSION_MAX = 8
 _POSTMORTEM_BUILD_LOCK = threading.Lock()
+_TOURNAMENT_PARQUET_HITS = 0
+_TOURNAMENT_PARQUET_MISSES = 0
+_LAST_TOURNAMENT_API_SUCCESS: Optional[str] = None
 
 
 class ClubApiError(Exception):
@@ -446,6 +449,50 @@ def dataset_info() -> Dict[str, Any]:
     }
     _dataset_info_cache = (now, info)
     return info
+
+
+def tournament_dataset_info() -> Dict[str, Any]:
+    """Tournament-specific parquet, cache, and live API status."""
+    path = TOURNAMENT_AUGMENTED_PARQUET_FILE
+    cache_files = list(TOURNAMENT_CACHE_DIR.glob("*.json"))
+    session_caches = [
+        item for item in cache_files if item.name.endswith(".session.json")
+    ]
+    listing_caches = [
+        item for item in cache_files if item.name.endswith(".sessions.json")
+    ]
+    postmortem_caches = [
+        item for item in POSTMORTEM_CACHE_DIR.glob("*.parquet")
+        if "-" in item.stem.rsplit("-", 1)[0]
+    ]
+    latest_cache = max(
+        (_file_mtime_iso(item) for item in cache_files),
+        default=None,
+    )
+    return {
+        "tournament_augmented_parquet": str(path) if path.is_file() else None,
+        "tournament_parquet_size_bytes": (
+            path.stat().st_size if path.is_file() else None
+        ),
+        "tournament_parquet_updated_at": (
+            _file_mtime_iso(path) if path.is_file() else None
+        ),
+        "tournament_parquet_hits": _TOURNAMENT_PARQUET_HITS,
+        "tournament_parquet_misses": _TOURNAMENT_PARQUET_MISSES,
+        "cached_tournament_sessions": len(session_caches),
+        "cached_tournament_player_listings": len(listing_caches),
+        "cached_tournament_postmortems": len(postmortem_caches),
+        "last_tournament_cache_update": latest_cache,
+        "last_live_api_success": (
+            _LAST_TOURNAMENT_API_SUCCESS or latest_cache
+        ),
+        "tournament_api_configured": bool(ACBL_API_KEY),
+        "note": (
+            "Tournament MCP reads historical augmented parquet first. "
+            "Official ACBL API access is limited to uncached pair sessions; "
+            "team and knockout sessions are reported as having no board results."
+        ),
+    }
 
 
 def _save_json(path: pathlib.Path, payload: Any) -> None:
@@ -1207,6 +1254,7 @@ def _session_kind(session_id: str) -> str:
 def _historical_augmented_parquet(
     session_id: str,
 ) -> Optional[Tuple[bytes, Dict[str, Any]]]:
+    global _TOURNAMENT_PARQUET_HITS, _TOURNAMENT_PARQUET_MISSES
     sid = str(session_id)
     kind = _session_kind(sid)
     path = (
@@ -1241,6 +1289,8 @@ def _historical_augmented_parquet(
                 hint="The augmented parquet may be updating; retry shortly.",
             )
         if frame.is_empty():
+            if kind == "tournament":
+                _TOURNAMENT_PARQUET_MISSES += 1
             return None
         output = io.BytesIO()
         frame.write_parquet(output, compression="zstd")
@@ -1250,6 +1300,8 @@ def _historical_augmented_parquet(
                 _AUGMENTED_SESSION_CACHE.pop(
                     next(iter(_AUGMENTED_SESSION_CACHE)))
             _AUGMENTED_SESSION_CACHE[key] = cached
+    if kind == "tournament":
+        _TOURNAMENT_PARQUET_HITS += 1
     return cached, {
         "source": f"historical {kind} augmented parquet",
         "source_tier": "historical",
@@ -1324,6 +1376,7 @@ def _require_tournament_api_key() -> str:
 def _tournament_api_get(
     url: str, params: Optional[Dict[str, Any]] = None
 ) -> requests.Response:
+    global _LAST_TOURNAMENT_API_SUCCESS
     response = requests.get(
         url,
         params=params,
@@ -1338,11 +1391,27 @@ def _tournament_api_get(
         timeout=60,
     )
     if not response.ok:
+        try:
+            payload = response.json()
+            detail = (
+                payload.get("detail")
+                or payload.get("message")
+                or payload.get("error")
+                or "; ".join(payload.get("messages") or [])
+                or response.text[:500]
+            )
+        except ValueError:
+            detail = response.text[:500]
         raise ClubApiError(
-            f"ACBL tournament API returned HTTP {response.status_code}",
-            status_code=502,
-            hint=response.text[:500],
+            f"ACBL tournament API returned HTTP {response.status_code}: {detail}",
+            status_code=(
+                response.status_code
+                if 400 <= response.status_code < 500
+                else 502
+            ),
+            hint="The official ACBL tournament API rejected this request.",
         )
+    _LAST_TOURNAMENT_API_SUCCESS = _now_iso()
     return response
 
 
@@ -1423,6 +1492,9 @@ def _historical_tournament_player_sessions(
                 f"{float(row['score']) * 100:.2f}%"
                 if row.get("score") is not None else None
             ),
+            "event_type": "Pairs",
+            "boards": True,
+            "unavailable_reason": None,
             "details_url": (
                 "https://live.acbl.org/event/"
                 f"{str(row['session_id']).replace('-', '/')}/summary"
@@ -1433,7 +1505,11 @@ def _historical_tournament_player_sessions(
     ]
 
 
-def _live_tournament_player_sessions(player_id: str) -> List[Dict[str, Any]]:
+def _live_tournament_player_sessions(
+    player_id: str,
+    *,
+    listing_source: str = "live ACBL tournament API",
+) -> List[Dict[str, Any]]:
     url: Optional[str] = (
         "https://api.acbl.org/v1/tournament/player/history_query")
     params: Optional[Dict[str, Any]] = {
@@ -1450,6 +1526,15 @@ def _live_tournament_player_sessions(player_id: str) -> List[Dict[str, Any]]:
             sid = str(item.get("session_id") or "")
             if not sid:
                 continue
+            event = item.get("event") or {}
+            event_type = str(
+                event.get("game_type")
+                or item.get("score_score_type")
+                or ""
+            ).strip()
+            has_boards = event_type.lower() in {
+                "pairs", "matchpoints", "imp pairs", "board-a-match"
+            }
             rows.append(
                 {
                     "session_id": sid,
@@ -1457,12 +1542,17 @@ def _live_tournament_player_sessions(player_id: str) -> List[Dict[str, Any]]:
                     "tournament_name": item.get("score_tournament_name"),
                     "event_name": item.get("score_event_name"),
                     "session": item.get("score_session_time_description"),
-                    "score": item.get("percentage"),
+                    "score": item.get("percentage") if has_boards else None,
+                    "event_type": event_type or None,
+                    "boards": has_boards,
+                    "unavailable_reason": (
+                        None if has_boards else "no_board_results"
+                    ),
                     "details_url": (
                         "https://live.acbl.org/event/"
                         f"{sid.replace('-', '/')}/summary"
                     ),
-                    "listing_source": "live ACBL tournament API",
+                    "listing_source": listing_source,
                 }
             )
         url = payload.get("next_page_url")
@@ -1493,17 +1583,32 @@ def tournament_player_sessions(
                 live = _load_json(cache_file)
     elif cache_file.is_file():
         live = _load_json(cache_file)
+        for row in live:
+            row["listing_source"] = "tournament API cache"
+            if "boards" not in row:
+                label = " ".join(
+                    str(row.get(key) or "")
+                    for key in ("event_type", "event_name")
+                ).lower()
+                row["boards"] = not any(
+                    token in label
+                    for token in ("swiss", "knockout", " ko", "teams")
+                )
+                row["unavailable_reason"] = (
+                    None if row["boards"] else "no_board_results"
+                )
+                if not row["boards"]:
+                    row["score"] = None
     if not historical and not live and not refresh:
         try:
             live = _live_tournament_player_sessions(pid)
             _save_json(cache_file, live)
         except (ClubApiError, requests.RequestException) as exc:
             live_error = str(exc)
-    merged = {
-        str(row["session_id"]): row
-        for row in historical
-    }
-    for row in live:
+    merged = {str(row["session_id"]): row for row in live}
+    # Historical rows are known to have board-level postmortems and must not
+    # be relabeled as live merely because the listing API also returned them.
+    for row in historical:
         merged[str(row["session_id"])] = row
     rows = sorted(
         merged.values(),
@@ -1522,6 +1627,18 @@ def tournament_player_sessions(
                 TOURNAMENT_AUGMENTED_PARQUET_FILE),
         },
     )
+
+
+def _cached_tournament_listing(
+    player_id: str, session_id: str
+) -> Optional[Dict[str, Any]]:
+    cache_file = TOURNAMENT_CACHE_DIR / f"{player_id}.sessions.json"
+    if not cache_file.is_file():
+        return None
+    for row in _load_json(cache_file):
+        if str(row.get("session_id")) == str(session_id):
+            return row
+    return None
 
 
 def session_augmented_parquet(
@@ -1586,6 +1703,27 @@ def session_augmented_parquet(
                 )
                 live_source = raw_meta.get("source")
             else:
+                listing = _cached_tournament_listing(pid, sid)
+                if listing is not None:
+                    event_type = str(
+                        listing.get("event_type")
+                        or listing.get("event_name")
+                        or "team/knockout"
+                    )
+                    label = event_type.lower()
+                    has_boards = listing.get("boards")
+                    if has_boards is False or any(
+                        token in label
+                        for token in ("swiss", "knockout", " ko", "teams")
+                    ):
+                        raise ClubApiError(
+                            (
+                                f"Tournament session {sid} has no board results "
+                                f"(event_type={event_type})"
+                            ),
+                            status_code=422,
+                            hint="unavailable_reason=no_board_results",
+                        )
                 data, live_source = tournament_session_data(
                     sid, refresh=refresh)
                 frame = build_tournament_postmortem(
@@ -1623,7 +1761,7 @@ _POSTMORTEM_SEATS = (
 _POSTMORTEM_BOARD_COLUMNS = [
     "Board", "Contract", "Declarer_Direction", "Declarer_ID", "Declarer_Name",
     "Result", "Tricks", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
-    "MP_NS", "MP_EW", "MP_Top", "Par_NS", "ParContract",
+    "MP_NS", "MP_EW", "MP_Top", "Par_NS",
     "Pair_Number_NS", "Pair_Number_EW", "PBN",
 ]
 _POSTMORTEM_CONTEXT_COLUMNS = [
@@ -1760,7 +1898,7 @@ def postmortem_dataframe(
         session_id,
         player_id=player_id,
         refresh=refresh,
-        allow_build=False,
+        allow_build=_session_kind(session_id) == "tournament",
     )
     frame = pl.read_parquet(io.BytesIO(payload))
     frame, player_meta = _personalize_postmortem(frame, player_id)
@@ -1775,6 +1913,7 @@ def postmortem_boards(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
+    global _TOURNAMENT_PARQUET_HITS
     wanted = (
         [name.strip() for name in columns.split(",") if name.strip()]
         if columns else _POSTMORTEM_BOARD_COLUMNS
@@ -1797,6 +1936,8 @@ def postmortem_boards(
             frame, meta = postmortem_dataframe(
                 session_id, player_id, refresh=refresh)
         else:
+            if source_meta.get("kind") == "tournament":
+                _TOURNAMENT_PARQUET_HITS += 1
             frame, player_meta = _personalize_postmortem(frame, player_id)
             meta = {**source_meta, **player_meta}
     else:
@@ -1804,6 +1945,18 @@ def postmortem_boards(
             session_id, player_id, refresh=refresh)
     if only_my_boards:
         frame = frame.filter(pl.col("Boards_I_Played"))
+    if meta.get("kind") == "tournament" and not frame.is_empty():
+        percent_columns = [
+            name for name in ("Pct_NS", "Pct_EW")
+            if name in frame.columns
+            and frame.get_column(name).max() is not None
+            and float(frame.get_column(name).max()) <= 1.0
+        ]
+        if percent_columns:
+            frame = frame.with_columns(
+                (pl.col(name) * 100).alias(name)
+                for name in percent_columns
+            )
     missing = [name for name in wanted if name not in frame.columns]
     selected = [name for name in wanted if name in frame.columns]
     if not selected:
@@ -1866,6 +2019,7 @@ def postmortem_schema(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
+    global _TOURNAMENT_PARQUET_HITS
     historical = _historical_postmortem_lazy(session_id)
     if historical is not None:
         lazy, source_meta = historical
@@ -1886,6 +2040,8 @@ def postmortem_schema(
             dtypes = dict(zip(
                 frame.columns, (str(dtype) for dtype in frame.dtypes)))
         else:
+            if source_meta.get("kind") == "tournament":
+                _TOURNAMENT_PARQUET_HITS += 1
             _context, player_meta = _personalize_postmortem(
                 context, player_id)
             meta = {**source_meta, **player_meta}

@@ -52,6 +52,15 @@ def health() -> dict:
     return {"status": "ok", "service": "acbl-results-api", **info}
 
 
+@app.get("/tournaments/info")
+def get_tournament_dataset_info() -> dict:
+    return {
+        "status": "ok",
+        "service": "acbl-results-api",
+        **svc.tournament_dataset_info(),
+    }
+
+
 @app.get("/clubs")
 def get_clubs(
     q: Optional[str] = Query(None, description="Substring filter on club id/name/location"),
