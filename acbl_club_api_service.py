@@ -1132,13 +1132,26 @@ def player_games(
     )
 
 
-def _fetch_session_json(session_id: str, refresh: bool = False) -> Tuple[Dict[str, Any], bool, pathlib.Path]:
+def _fetch_session_json(
+    session_id: str,
+    refresh: bool = False,
+    allow_live: bool = True,
+) -> Tuple[Dict[str, Any], bool, pathlib.Path]:
     sid = str(session_id).strip()
     if not sid.isdigit():
         raise ClubApiError("session_id must be a numeric club event id", status_code=400)
     cached_path = find_session_cache(sid)
     if cached_path is not None and not refresh:
         return _load_json(cached_path), True, cached_path
+    if not allow_live:
+        raise ClubApiError(
+            f"Raw tables for session {sid} are absent from normalized session parquets and JSON archive",
+            status_code=404,
+            hint=(
+                "Use the club postmortem boards, schema, or SQL tools for "
+                "historical sessions in the augmented parquet."
+            ),
+        )
 
     url = f"{ACBL_ORIGIN}/club-results/details/{sid}"
     try:
@@ -1210,13 +1223,17 @@ def _historical_augmented_parquet(
     if cached is None:
         lazy = pl.scan_parquet(path)
         id_column = "event_id" if kind == "club" else "session_id"
-        if id_column not in lazy.collect_schema().names():
+        schema = lazy.collect_schema()
+        if id_column not in schema.names():
             raise ClubApiError(
                 f"{path.name} does not contain {id_column}",
                 status_code=500,
             )
+        # Preserve Parquet predicate pushdown. Casting the 81 GiB monolith's
+        # event_id to String forced a full scan before applying the filter.
+        id_value: Any = int(sid) if schema[id_column].is_integer() else sid
         frame = _collect_retry(
-            lazy.filter(pl.col(id_column).cast(pl.String) == sid))
+            lazy.filter(pl.col(id_column) == id_value))
         if frame is None:
             raise ClubApiError(
                 f"Could not read historical postmortem {session_id}",
@@ -1511,6 +1528,7 @@ def session_augmented_parquet(
     session_id: str,
     player_id: Optional[str] = None,
     refresh: bool = False,
+    allow_build: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Resolve a complete postmortem without involving Streamlit."""
     sid = str(session_id)
@@ -1538,6 +1556,12 @@ def session_augmented_parquet(
                 "kind": _session_kind(sid),
                 "fetched_at": _file_mtime_iso(cache_file),
             }
+    if not allow_build:
+        raise ClubApiError(
+            f"Session {sid} is absent from historical augmented parquet and API cache",
+            status_code=404,
+            hint="MCP postmortem requests do not scrape or build sessions live.",
+        )
 
     with _POSTMORTEM_BUILD_LOCK:
         if cache_file.is_file() and not refresh:
@@ -1602,6 +1626,56 @@ _POSTMORTEM_BOARD_COLUMNS = [
     "MP_NS", "MP_EW", "MP_Top", "Par_NS", "ParContract",
     "Pair_Number_NS", "Pair_Number_EW", "PBN",
 ]
+_POSTMORTEM_CONTEXT_COLUMNS = [
+    "section_name", "Date", "Declarer_ID", "Declarer_Direction",
+    "Pair_Number_NS", "Pair_Number_EW",
+    *(f"Player_ID_{seat}" for seat in "NESW"),
+    *(f"Player_Name_{seat}" for seat in "NESW"),
+]
+_POSTMORTEM_DERIVED_DTYPES = {
+    "Opponent_Pair_Direction": "String",
+    "My_Section": "Boolean",
+    "Our_Section": "Boolean",
+    "My_Pair": "Boolean",
+    "Our_Pair": "Boolean",
+    "Boards_I_Played": "Boolean",
+    "Boards_We_Played": "Boolean",
+    "Our_Boards": "Boolean",
+    "Boards_I_Declared": "Boolean",
+    "Boards_Partner_Declared": "Boolean",
+    "Boards_Opponent_Declared": "Boolean",
+    "Boards_We_Declared": "Boolean",
+}
+
+
+def _historical_postmortem_lazy(
+    session_id: str,
+) -> Optional[Tuple[pl.LazyFrame, Dict[str, Any]]]:
+    """Return a predicate-pushed historical session scan without collecting it."""
+    sid = str(session_id)
+    kind = _session_kind(sid)
+    path = (
+        AUGMENTED_PARQUET_FILE
+        if kind == "club"
+        else TOURNAMENT_AUGMENTED_PARQUET_FILE
+    )
+    if not path.is_file():
+        return None
+    lazy = pl.scan_parquet(path)
+    id_column = "event_id" if kind == "club" else "session_id"
+    schema = lazy.collect_schema()
+    if id_column not in schema.names():
+        raise ClubApiError(
+            f"{path.name} does not contain {id_column}", status_code=500)
+    id_value: Any = int(sid) if schema[id_column].is_integer() else sid
+    return lazy.filter(pl.col(id_column) == id_value), {
+        "source": f"historical {kind} augmented parquet",
+        "source_tier": "historical",
+        "source_file": path.name,
+        "session_id": sid,
+        "kind": kind,
+        "fetched_at": _file_mtime_iso(path),
+    }
 
 
 def _personalize_postmortem(
@@ -1683,7 +1757,11 @@ def postmortem_dataframe(
     refresh: bool = False,
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
     payload, source_meta = session_augmented_parquet(
-        session_id, player_id=player_id, refresh=refresh)
+        session_id,
+        player_id=player_id,
+        refresh=refresh,
+        allow_build=False,
+    )
     frame = pl.read_parquet(io.BytesIO(payload))
     frame, player_meta = _personalize_postmortem(frame, player_id)
     return frame, {**source_meta, **player_meta}
@@ -1697,14 +1775,35 @@ def postmortem_boards(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
-    frame, meta = postmortem_dataframe(
-        session_id, player_id, refresh=refresh)
-    if only_my_boards:
-        frame = frame.filter(pl.col("Boards_I_Played"))
     wanted = (
         [name.strip() for name in columns.split(",") if name.strip()]
         if columns else _POSTMORTEM_BOARD_COLUMNS
     )
+    historical = _historical_postmortem_lazy(session_id)
+    if historical is not None:
+        lazy, source_meta = historical
+        names = lazy.collect_schema().names()
+        selected_for_scan = list(dict.fromkeys(
+            name for name in [*wanted, *_POSTMORTEM_CONTEXT_COLUMNS]
+            if name in names
+        ))
+        frame = _collect_retry(lazy.select(selected_for_scan))
+        if frame is None:
+            raise ClubApiError(
+                f"Could not read historical postmortem {session_id}",
+                status_code=503,
+            )
+        if frame.is_empty():
+            frame, meta = postmortem_dataframe(
+                session_id, player_id, refresh=refresh)
+        else:
+            frame, player_meta = _personalize_postmortem(frame, player_id)
+            meta = {**source_meta, **player_meta}
+    else:
+        frame, meta = postmortem_dataframe(
+            session_id, player_id, refresh=refresh)
+    if only_my_boards:
+        frame = frame.filter(pl.col("Boards_I_Played"))
     missing = [name for name in wanted if name not in frame.columns]
     selected = [name for name in wanted if name in frame.columns]
     if not selected:
@@ -1767,9 +1866,40 @@ def postmortem_schema(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
-    frame, meta = postmortem_dataframe(
-        session_id, player_id, refresh=refresh)
-    names = sorted(frame.columns)
+    historical = _historical_postmortem_lazy(session_id)
+    if historical is not None:
+        lazy, source_meta = historical
+        schema = lazy.collect_schema()
+        context_columns = [
+            name for name in _POSTMORTEM_CONTEXT_COLUMNS
+            if name in schema.names()
+        ]
+        context = _collect_retry(lazy.select(context_columns))
+        if context is None:
+            raise ClubApiError(
+                f"Could not read historical postmortem {session_id}",
+                status_code=503,
+            )
+        if context.is_empty():
+            frame, meta = postmortem_dataframe(
+                session_id, player_id, refresh=refresh)
+            dtypes = dict(zip(
+                frame.columns, (str(dtype) for dtype in frame.dtypes)))
+        else:
+            _context, player_meta = _personalize_postmortem(
+                context, player_id)
+            meta = {**source_meta, **player_meta}
+            dtypes = {
+                name: str(dtype)
+                for name, dtype in zip(schema.names(), schema.dtypes())
+            }
+            dtypes.update(_POSTMORTEM_DERIVED_DTYPES)
+    else:
+        frame, meta = postmortem_dataframe(
+            session_id, player_id, refresh=refresh)
+        dtypes = dict(zip(
+            frame.columns, (str(dtype) for dtype in frame.dtypes)))
+    names = sorted(dtypes)
     if pattern:
         try:
             regex = re.compile(pattern, re.IGNORECASE)
@@ -1780,9 +1910,8 @@ def postmortem_schema(
     cap = clamp_limit(limit, default=200)
     matched = len(names)
     names = names[:cap]
-    dtypes = dict(zip(frame.columns, (str(dtype) for dtype in frame.dtypes)))
     return {
-        "total_columns": frame.width,
+        "total_columns": len(dtypes),
         "matched_columns": matched,
         "truncated": matched > cap,
         "columns": {name: dtypes[name] for name in names},
@@ -2028,7 +2157,11 @@ def session_frames_from_json(data: Dict[str, Any]) -> Dict[str, pl.DataFrame]:
     return dfs
 
 
-def session_dataframes(session_id: str, refresh: bool = False) -> Tuple[Dict[str, pl.DataFrame], Dict[str, Any]]:
+def session_dataframes(
+    session_id: str,
+    refresh: bool = False,
+    allow_live: bool = True,
+) -> Tuple[Dict[str, pl.DataFrame], Dict[str, Any]]:
     if not refresh:
         parquet_key = _parquet_session_cache_key(str(session_id))
         with _SESSION_DF_LOCK:
@@ -2064,7 +2197,8 @@ def session_dataframes(session_id: str, refresh: bool = False) -> Tuple[Dict[str
                 "cache_file": None,
             }
 
-    data, cached, path = _fetch_session_json(session_id, refresh=refresh)
+    data, cached, path = _fetch_session_json(
+        session_id, refresh=refresh, allow_live=allow_live)
     mtime = path.stat().st_mtime if path.exists() else 0.0
     key = (str(path), mtime)
     with _SESSION_DF_LOCK:
@@ -2124,8 +2258,13 @@ def session_frames_payload(session_id: str, refresh: bool = False) -> Dict[str, 
     }
 
 
-def session_tables(session_id: str, refresh: bool = False) -> Dict[str, Any]:
-    dfs, meta = session_dataframes(session_id, refresh=refresh)
+def session_tables(
+    session_id: str,
+    refresh: bool = False,
+    allow_live: bool = True,
+) -> Dict[str, Any]:
+    dfs, meta = session_dataframes(
+        session_id, refresh=refresh, allow_live=allow_live)
     rows = [
         {
             "table": name,
@@ -2144,8 +2283,10 @@ def session_results(
     columns: Optional[str] = None,
     limit: Optional[int] = None,
     refresh: bool = False,
+    allow_live: bool = True,
 ) -> Dict[str, Any]:
-    dfs, meta = session_dataframes(session_id, refresh=refresh)
+    dfs, meta = session_dataframes(
+        session_id, refresh=refresh, allow_live=allow_live)
     name = (table or "board_results").strip()
     if name not in dfs:
         raise ClubApiError(
@@ -2169,10 +2310,17 @@ def session_results(
     return dataframe_to_table(frame, limit=limit, meta=meta)
 
 
-def session_sql(session_id: str, sql: str, limit: Optional[int] = None, refresh: bool = False) -> Dict[str, Any]:
+def session_sql(
+    session_id: str,
+    sql: str,
+    limit: Optional[int] = None,
+    refresh: bool = False,
+    allow_live: bool = True,
+) -> Dict[str, Any]:
     if not sql or not sql.strip():
         raise ClubApiError("sql is required", status_code=400)
-    dfs, meta = session_dataframes(session_id, refresh=refresh)
+    dfs, meta = session_dataframes(
+        session_id, refresh=refresh, allow_live=allow_live)
     cap = clamp_limit(limit)
     query = sql.strip().rstrip(";")
     con = duckdb.connect(config={"enable_external_access": "false"})

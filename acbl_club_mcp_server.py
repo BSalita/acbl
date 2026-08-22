@@ -140,7 +140,10 @@ def acbl_session_tables(session_id: str, refresh: bool = False) -> Dict[str, Any
     """Table names, row counts, and columns for one club session
     (event, club, sessions, sections, boards, board_results, pair_summaries,
     players, hand_records, strat_place, standings)."""
-    return _club_get(f"/sessions/{session_id}/tables", {"refresh": refresh})
+    return _club_get(
+        f"/sessions/{session_id}/tables",
+        {"refresh": refresh, "allow_live": False},
+    )
 
 
 @mcp.tool()
@@ -156,7 +159,12 @@ def acbl_session_results(
     comma-separated subset."""
     return _club_get(
         f"/sessions/{session_id}/tables/{table}",
-        {"columns": columns, "limit": limit, "refresh": refresh},
+        {
+            "columns": columns,
+            "limit": limit,
+            "refresh": refresh,
+            "allow_live": False,
+        },
     )
 
 
@@ -166,7 +174,12 @@ def acbl_session_sql(session_id: str, sql: str, limit: int = 200, refresh: bool 
     off). Example: SELECT pair_number, percentage FROM pair_summaries ORDER BY percentage DESC."""
     return _club_get(
         f"/sessions/{session_id}/sql",
-        {"sql": sql, "limit": limit, "refresh": refresh},
+        {
+            "sql": sql,
+            "limit": limit,
+            "refresh": refresh,
+            "allow_live": False,
+        },
     )
 
 

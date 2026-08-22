@@ -113,8 +113,13 @@ def get_tournament_player_sessions(
 
 
 @app.get("/sessions/{session_id}/tables")
-def get_session_tables(session_id: str, refresh: bool = Query(False)) -> dict:
-    return svc.session_tables(session_id, refresh=refresh)
+def get_session_tables(
+    session_id: str,
+    refresh: bool = Query(False),
+    allow_live: bool = Query(True),
+) -> dict:
+    return svc.session_tables(
+        session_id, refresh=refresh, allow_live=allow_live)
 
 
 @app.get("/sessions/{session_id}/tables/{table_name}")
@@ -124,6 +129,7 @@ def get_session_table(
     columns: Optional[str] = Query(None, description="Comma-separated column names"),
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
+    allow_live: bool = Query(True),
 ) -> dict:
     return svc.session_results(
         session_id,
@@ -131,6 +137,7 @@ def get_session_table(
         columns=columns,
         limit=limit,
         refresh=refresh,
+        allow_live=allow_live,
     )
 
 
@@ -252,8 +259,15 @@ def get_session_sql(
     sql: str = Query(..., description="DuckDB SQL against registered session tables"),
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
+    allow_live: bool = Query(True),
 ) -> dict:
-    return svc.session_sql(session_id, sql=sql, limit=limit, refresh=refresh)
+    return svc.session_sql(
+        session_id,
+        sql=sql,
+        limit=limit,
+        refresh=refresh,
+        allow_live=allow_live,
+    )
 
 
 @app.get("/sessions/{session_id}")
@@ -263,6 +277,7 @@ def get_session_default(
     columns: Optional[str] = None,
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
+    allow_live: bool = Query(True),
 ) -> dict:
     return svc.session_results(
         session_id,
@@ -270,6 +285,7 @@ def get_session_default(
         columns=columns,
         limit=limit,
         refresh=refresh,
+        allow_live=allow_live,
     )
 
 
