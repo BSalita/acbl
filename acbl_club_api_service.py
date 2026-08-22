@@ -980,6 +980,8 @@ def player_games(
     source = "cache"
     fetched_at: Optional[str] = None
     rows: List[Dict[str, Any]] = []
+    refresh_error: Optional[str] = None
+    refresh_attempts: List[Dict[str, Any]] = []
 
     parquet_rows = _player_games_from_parquet(pid)
     if parquet_rows:
@@ -1008,14 +1010,40 @@ def player_games(
     # partial cache cannot satisfy a request for more rows than it holds.
     if refresh or not rows or (not complete and len(rows) < cap):
         scrape_limit = min(cap, GAP_SCRAPE_LIMIT) if parquet_rows else cap
-        try:
-            html, live_complete = _playwright_paginated_html(
-                source_url, limit=scrape_limit, count_items=_count_detail_links
-            )
-        except ClubApiError:
-            if not rows:
-                raise
-            # Scrape failed (e.g. Cloudflare); serve what the caches have.
+        html: Optional[str] = None
+        live_complete = False
+        last_error: Optional[ClubApiError] = None
+        # A headed browser/profile startup can fail transiently even when the
+        # Cloudflare clearance is valid. A stale fallback is especially harmful
+        # here because the caller uses the first row as "latest game".
+        attempts = 2 if refresh else 1
+        for attempt in range(attempts):
+            try:
+                html, live_complete = _playwright_paginated_html(
+                    source_url, limit=scrape_limit, count_items=_count_detail_links
+                )
+                refresh_attempts.append(
+                    {"attempt": attempt + 1, "status": "success"}
+                )
+                last_error = None
+                break
+            except ClubApiError as exc:
+                refresh_attempts.append(
+                    {
+                        "attempt": attempt + 1,
+                        "status": "error",
+                        "status_code": exc.status_code,
+                        "detail": exc.detail,
+                    }
+                )
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(1.0)
+        if html is None:
+            if not rows and last_error is not None:
+                raise last_error
+            # Serve history, but report that the requested refresh failed.
+            refresh_error = last_error.detail if last_error is not None else "Unknown scrape failure"
         else:
             live_rows = parse_player_games_html(html, pid)
             if live_rows:
@@ -1042,6 +1070,9 @@ def player_games(
             "cached": cached,
             "complete": complete,
             "fetched_at": fetched_at,
+            "refresh_failed": refresh_error is not None,
+            "refresh_error": refresh_error,
+            "refresh_attempts": refresh_attempts,
         },
     )
 
