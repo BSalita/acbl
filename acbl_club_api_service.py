@@ -1249,6 +1249,51 @@ def _postmortem_cache_file(session_id: str, player_id: str) -> pathlib.Path:
     return POSTMORTEM_CACHE_DIR / f"{safe_session}-{safe_player}.parquet"
 
 
+def _validated_postmortem_cache(
+    cache_file: pathlib.Path, player_id: str
+) -> Optional[bytes]:
+    """Normalize legacy float IDs and reject caches for the wrong player."""
+    try:
+        frame = pl.read_parquet(cache_file)
+    except Exception:
+        cache_file.unlink(missing_ok=True)
+        return None
+    player_columns = [
+        name for name in (f"Player_ID_{seat}" for seat in "NESW")
+        if name in frame.columns
+    ]
+    if not player_columns:
+        cache_file.unlink(missing_ok=True)
+        return None
+    has_legacy_float_ids = any(
+        frame.filter(
+            pl.col(name).cast(pl.String).str.ends_with(".0")
+        ).height > 0
+        for name in player_columns
+    )
+    frame = frame.with_columns(
+        pl.col(name)
+        .cast(pl.String)
+        .str.strip_chars()
+        .str.replace(r"\.0$", "")
+        .alias(name)
+        for name in player_columns
+    )
+    pid = str(player_id).strip()
+    if not any(
+        frame.filter(pl.col(name) == pid).height > 0
+        for name in player_columns
+    ):
+        cache_file.unlink(missing_ok=True)
+        return None
+    if has_legacy_float_ids:
+        temp_file = cache_file.with_suffix(
+            f".{threading.get_ident()}.validated.tmp.parquet")
+        frame.write_parquet(temp_file, compression="zstd")
+        os.replace(temp_file, cache_file)
+    return cache_file.read_bytes()
+
+
 def _require_tournament_api_key() -> str:
     if not ACBL_API_KEY:
         raise ClubApiError(
@@ -1482,19 +1527,9 @@ def session_augmented_parquet(
         )
     cache_file = _postmortem_cache_file(sid, pid)
     if cache_file.is_file() and not refresh:
-        return cache_file.read_bytes(), {
-            "source": "API-generated postmortem parquet cache",
-            "source_tier": "cache",
-            "source_file": cache_file.name,
-            "session_id": sid,
-            "player_id": pid,
-            "kind": _session_kind(sid),
-            "fetched_at": _file_mtime_iso(cache_file),
-        }
-
-    with _POSTMORTEM_BUILD_LOCK:
-        if cache_file.is_file() and not refresh:
-            return cache_file.read_bytes(), {
+        cached = _validated_postmortem_cache(cache_file, pid)
+        if cached is not None:
+            return cached, {
                 "source": "API-generated postmortem parquet cache",
                 "source_tier": "cache",
                 "source_file": cache_file.name,
@@ -1503,6 +1538,20 @@ def session_augmented_parquet(
                 "kind": _session_kind(sid),
                 "fetched_at": _file_mtime_iso(cache_file),
             }
+
+    with _POSTMORTEM_BUILD_LOCK:
+        if cache_file.is_file() and not refresh:
+            cached = _validated_postmortem_cache(cache_file, pid)
+            if cached is not None:
+                return cached, {
+                    "source": "API-generated postmortem parquet cache",
+                    "source_tier": "cache",
+                    "source_file": cache_file.name,
+                    "session_id": sid,
+                    "player_id": pid,
+                    "kind": _session_kind(sid),
+                    "fetched_at": _file_mtime_iso(cache_file),
+                }
         try:
             if _session_kind(sid) == "club":
                 frames, raw_meta = session_dataframes(sid, refresh=refresh)
