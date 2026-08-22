@@ -1,4 +1,4 @@
-"""FastAPI service exposing ACBL club-results pages as JSON tables.
+"""FastAPI service exposing unified ACBL club and tournament results.
 
 Scraping, cache, and table-building live here. The MCP server is a thin
 HTTP client of this API (see acbl_club_mcp_server.py).
@@ -21,10 +21,10 @@ import acbl_club_api_service as svc
 ACBL_CLUB_API_PORT = int(os.environ.get("ACBL_CLUB_API_PORT", "8508"))
 
 app = FastAPI(
-    title="ACBL Club Results API",
+    title="ACBL Results API",
     description=(
-        "Cache-first JSON tables scraped from my.acbl.org club-results pages. "
-        "Not the DD/Elo-augmented postmortem parquet API."
+        "Shared club and tournament listings plus augmented postmortems. "
+        "Historical parquet, API cache, and live sources use one interface."
     ),
     version="1.0.0",
 )
@@ -49,7 +49,7 @@ async def club_api_error_handler(request, exc: svc.ClubApiError) -> JSONResponse
 @app.get("/health")
 def health() -> dict:
     info = svc.dataset_info()
-    return {"status": "ok", "service": "acbl-club-api", **info}
+    return {"status": "ok", "service": "acbl-results-api", **info}
 
 
 @app.get("/clubs")
@@ -102,6 +102,16 @@ def get_player_games(
     return svc.player_games(player_id, limit=limit, refresh=refresh)
 
 
+@app.get("/tournaments/players/{player_id}/sessions")
+def get_tournament_player_sessions(
+    player_id: str,
+    limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
+    refresh: bool = Query(False),
+) -> dict:
+    return svc.tournament_player_sessions(
+        player_id, limit=limit, refresh=refresh)
+
+
 @app.get("/sessions/{session_id}/tables")
 def get_session_tables(session_id: str, refresh: bool = Query(False)) -> dict:
     return svc.session_tables(session_id, refresh=refresh)
@@ -141,9 +151,14 @@ def get_session_frames(session_id: str, refresh: bool = Query(False)) -> dict:
 
 
 @app.get("/sessions/{session_id}/postmortem.parquet")
-def get_session_postmortem_parquet(session_id: str) -> Response:
-    """Pre-augmented historical postmortem as a compact Parquet response."""
-    payload, meta = svc.session_augmented_parquet(session_id)
+def get_session_postmortem_parquet(
+    session_id: str,
+    player_id: Optional[str] = Query(None),
+    refresh: bool = Query(False),
+) -> Response:
+    """Compatibility route for a complete API-resolved postmortem."""
+    payload, meta = svc.session_augmented_parquet(
+        session_id, player_id=player_id, refresh=refresh)
     return Response(
         content=payload,
         media_type="application/vnd.apache.parquet",
@@ -153,7 +168,81 @@ def get_session_postmortem_parquet(session_id: str) -> Response:
             ),
             "X-ACBL-Data-Source": str(meta["source"]),
             "X-ACBL-Data-Updated": str(meta["fetched_at"] or ""),
+            "X-ACBL-Data-Tier": str(meta.get("source_tier") or ""),
         },
+    )
+
+
+@app.get("/postmortems/{session_id}.parquet")
+def get_postmortem_parquet(
+    session_id: str,
+    player_id: Optional[str] = Query(None),
+    refresh: bool = Query(False),
+) -> Response:
+    return get_session_postmortem_parquet(
+        session_id, player_id=player_id, refresh=refresh)
+
+
+@app.get("/tournaments/sessions/{session_id}/postmortem.parquet")
+def get_tournament_postmortem_parquet(
+    session_id: str,
+    player_id: Optional[str] = Query(None),
+    refresh: bool = Query(False),
+) -> Response:
+    return get_session_postmortem_parquet(
+        session_id, player_id=player_id, refresh=refresh)
+
+
+@app.get("/postmortems/{session_id}/boards")
+def get_postmortem_boards(
+    session_id: str,
+    player_id: str = Query(...),
+    only_my_boards: bool = Query(True),
+    columns: Optional[str] = Query(None),
+    limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
+    refresh: bool = Query(False),
+) -> dict:
+    return svc.postmortem_boards(
+        session_id,
+        player_id,
+        only_my_boards=only_my_boards,
+        columns=columns,
+        limit=limit,
+        refresh=refresh,
+    )
+
+
+@app.get("/postmortems/{session_id}/sql")
+def get_postmortem_sql(
+    session_id: str,
+    player_id: str = Query(...),
+    sql: str = Query(...),
+    limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
+    refresh: bool = Query(False),
+) -> dict:
+    return svc.postmortem_sql(
+        session_id,
+        player_id,
+        sql,
+        limit=limit,
+        refresh=refresh,
+    )
+
+
+@app.get("/postmortems/{session_id}/schema")
+def get_postmortem_schema(
+    session_id: str,
+    player_id: str = Query(...),
+    pattern: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=svc.MAX_ROW_LIMIT),
+    refresh: bool = Query(False),
+) -> dict:
+    return svc.postmortem_schema(
+        session_id,
+        player_id,
+        pattern=pattern,
+        limit=limit,
+        refresh=refresh,
     )
 
 
@@ -188,7 +277,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print(
-        f"[acbl-club-api] starting on :{ACBL_CLUB_API_PORT}; cache -> {svc.CACHE_DIR}",
+        f"[acbl-results-api] starting on :{ACBL_CLUB_API_PORT}; cache -> {svc.CACHE_DIR}",
         flush=True,
     )
     uvicorn.run(

@@ -1,7 +1,10 @@
-"""Streamlit-free core for the ACBL club-results API.
+"""Streamlit-free core for the unified ACBL results API.
 
 Cache-first reads of club-results/<club_id>/details/<session_id>.data.json,
 with Playwright fetches of my.acbl.org when the cache misses or refresh=True.
+Tournament history and sessions use the official ACBL API. Fully augmented
+postmortems resolve from historical monoliths, then an API-owned parquet cache,
+then a headless live build.
 Does not import the downloader CLI (it uses a process-global browser and
 os._exit). Playwright helpers come from mlBridge.mlBridgeAcblLib.
 """
@@ -23,10 +26,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import duckdb
 import pandas as pd
 import polars as pl
+import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 _APP_DIR = pathlib.Path(__file__).resolve().parent
 _SRC_DIR = _APP_DIR.parent
+load_dotenv(_SRC_DIR / "Bridge_Game_Postmortem_Chatbot" / ".env")
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
@@ -38,6 +44,10 @@ from mlBridge.mlBridgeAcblLib import (  # noqa: E402
     get_club_results_details_data_playwright,
     parse_acbl_events_from_html,
     resolve_acbl_browser_profile_dir,
+)
+from mlBridge.mlBridgeAcblPostmortemLib import (  # noqa: E402
+    build_club_postmortem,
+    build_tournament_postmortem,
 )
 
 ACBL_ORIGIN = "https://my.acbl.org"
@@ -82,6 +92,8 @@ PARQUET_DIR = pathlib.Path(
     os.environ.get("ACBL_CLUB_PARQUET_DIR", "e:/bridge/data/acbl/club_results_parquet")
 )
 _AUGMENTED_FILENAME = "acbl_club_board_results_augmented.parquet"
+_TOURNAMENT_AUGMENTED_FILENAME = (
+    "acbl_tournament_board_results_augmented.parquet")
 
 
 def _default_augmented_parquet_file() -> pathlib.Path:
@@ -96,9 +108,40 @@ def _default_augmented_parquet_file() -> pathlib.Path:
 
 AUGMENTED_PARQUET_FILE = _default_augmented_parquet_file()
 
+
+def _default_tournament_augmented_parquet_file() -> pathlib.Path:
+    env = os.environ.get("ACBL_TOURNAMENT_AUGMENTED_PARQUET")
+    if env:
+        return pathlib.Path(env)
+    deployed = PARQUET_DIR / _TOURNAMENT_AUGMENTED_FILENAME
+    if deployed.is_file():
+        return deployed
+    return pathlib.Path("e:/bridge/data/acbl") / _TOURNAMENT_AUGMENTED_FILENAME
+
+
+TOURNAMENT_AUGMENTED_PARQUET_FILE = (
+    _default_tournament_augmented_parquet_file())
+POSTMORTEM_CACHE_DIR = pathlib.Path(
+    os.environ.get(
+        "ACBL_POSTMORTEM_API_CACHE_DIR",
+        str(CACHE_DIR / "_postmortems"),
+    )
+)
+TOURNAMENT_CACHE_DIR = pathlib.Path(
+    os.environ.get(
+        "ACBL_TOURNAMENT_CACHE_DIR",
+        str(CACHE_DIR / "_tournaments"),
+    )
+)
+ACBL_API_KEY = os.environ.get("ACBL_API_KEY", "").strip()
+SINGLE_DUMMY_SAMPLE_COUNT = int(
+    os.environ.get("ACBL_SINGLE_DUMMY_SAMPLE_COUNT", "40"))
+
 # Ensure the cache dir exists up front: CACHE_ROOTS is fixed at import, and a
 # missing dir would otherwise be excluded from reads even after writes create it.
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+POSTMORTEM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TOURNAMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CACHE_ROOTS: List[pathlib.Path] = [
     root for root in (CACHE_DIR, ARCHIVE_CACHE_DIR) if root.is_dir()
@@ -125,6 +168,7 @@ _SESSION_DF_MAX = 8
 _AUGMENTED_SESSION_CACHE: Dict[Tuple[str, float], bytes] = {}
 _AUGMENTED_SESSION_LOCK = threading.Lock()
 _AUGMENTED_SESSION_MAX = 8
+_POSTMORTEM_BUILD_LOCK = threading.Lock()
 
 
 class ClubApiError(Exception):
@@ -379,14 +423,25 @@ def dataset_info() -> Dict[str, Any]:
         "archive_clubs": archive_clubs,
         "parquet_dir": str(PARQUET_DIR) if PARQUET_DIR.is_dir() else None,
         "parquet_updated_at": _parquet_updated_iso(),
+        "club_augmented_parquet": (
+            str(AUGMENTED_PARQUET_FILE)
+            if AUGMENTED_PARQUET_FILE.is_file() else None
+        ),
+        "tournament_augmented_parquet": (
+            str(TOURNAMENT_AUGMENTED_PARQUET_FILE)
+            if TOURNAMENT_AUGMENTED_PARQUET_FILE.is_file() else None
+        ),
+        "postmortem_cache_dir": str(POSTMORTEM_CACHE_DIR),
+        "cached_postmortems": sum(
+            1 for _ in POSTMORTEM_CACHE_DIR.glob("*.parquet")),
+        "tournament_api_configured": bool(ACBL_API_KEY),
         "write_cache_dir": str(WRITE_CACHE_DIR),
         "chrome_profile": str(profile) if profile else None,
         "player_info_parquet": str(parquet) if parquet else None,
         "note": (
-            "Cache tiers: club_results_parquet (listings/lookups, refreshed by "
-            "acbl_all.bat stage 1b), club-results JSON archive (session details, "
-            "stage 1a), then live Playwright for anything newer. This is raw "
-            "club-page data, not the DD/Elo-augmented postmortem parquet cache."
+            "Club and tournament postmortems resolve from historical augmented "
+            "parquets, then the API parquet cache, then a headless live build. "
+            "Both Streamlit and MCP clients use this API."
         ),
     }
     _dataset_info_cache = (now, info)
@@ -1132,35 +1187,36 @@ def session_raw_with_source(
     return data, source
 
 
-def session_augmented_parquet(
-    session_id: str,
-) -> Tuple[bytes, Dict[str, Any]]:
-    """Return one historical postmortem filtered from the Stage 3c monolith."""
-    path = AUGMENTED_PARQUET_FILE
-    if not path.is_file():
-        raise ClubApiError(
-            "Historical augmented postmortem data is not deployed",
-            status_code=404,
-            hint=(
-                f"Deploy {_AUGMENTED_FILENAME}; recent sessions can still use "
-                "the JSON/live augmentation fallback."
-            ),
-        )
+def _session_kind(session_id: str) -> str:
+    return "club" if str(session_id).isdigit() else "tournament"
 
+
+def _historical_augmented_parquet(
+    session_id: str,
+) -> Optional[Tuple[bytes, Dict[str, Any]]]:
     sid = str(session_id)
-    key = (sid, path.stat().st_mtime)
+    kind = _session_kind(sid)
+    path = (
+        AUGMENTED_PARQUET_FILE
+        if kind == "club"
+        else TOURNAMENT_AUGMENTED_PARQUET_FILE
+    )
+    if not path.is_file():
+        return None
+
+    key = (f"{path}:{sid}", path.stat().st_mtime)
     with _AUGMENTED_SESSION_LOCK:
         cached = _AUGMENTED_SESSION_CACHE.get(key)
     if cached is None:
         lazy = pl.scan_parquet(path)
-        if "event_id" not in lazy.collect_schema().names():
+        id_column = "event_id" if kind == "club" else "session_id"
+        if id_column not in lazy.collect_schema().names():
             raise ClubApiError(
-                f"{path.name} does not contain event_id",
+                f"{path.name} does not contain {id_column}",
                 status_code=500,
             )
         frame = _collect_retry(
-            lazy.filter(pl.col("event_id").cast(pl.Utf8) == sid)
-        )
+            lazy.filter(pl.col(id_column).cast(pl.String) == sid))
         if frame is None:
             raise ClubApiError(
                 f"Could not read historical postmortem {session_id}",
@@ -1168,24 +1224,520 @@ def session_augmented_parquet(
                 hint="The augmented parquet may be updating; retry shortly.",
             )
         if frame.is_empty():
-            raise ClubApiError(
-                f"Session {session_id} is newer than or absent from the augmented parquet",
-                status_code=404,
-                hint="Use the session-frames endpoint to build it from recent JSON/live data.",
-            )
+            return None
         output = io.BytesIO()
         frame.write_parquet(output, compression="zstd")
         cached = output.getvalue()
         with _AUGMENTED_SESSION_LOCK:
             if len(_AUGMENTED_SESSION_CACHE) >= _AUGMENTED_SESSION_MAX:
-                _AUGMENTED_SESSION_CACHE.pop(next(iter(_AUGMENTED_SESSION_CACHE)))
+                _AUGMENTED_SESSION_CACHE.pop(
+                    next(iter(_AUGMENTED_SESSION_CACHE)))
             _AUGMENTED_SESSION_CACHE[key] = cached
-
     return cached, {
-        "source": "historical augmented parquet",
+        "source": f"historical {kind} augmented parquet",
+        "source_tier": "historical",
         "source_file": path.name,
         "session_id": sid,
+        "kind": kind,
         "fetched_at": _file_mtime_iso(path),
+    }
+
+
+def _postmortem_cache_file(session_id: str, player_id: str) -> pathlib.Path:
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))
+    safe_player = re.sub(r"[^A-Za-z0-9_.-]", "_", str(player_id))
+    return POSTMORTEM_CACHE_DIR / f"{safe_session}-{safe_player}.parquet"
+
+
+def _require_tournament_api_key() -> str:
+    if not ACBL_API_KEY:
+        raise ClubApiError(
+            "The ACBL tournament API bearer token is not configured",
+            status_code=503,
+            hint="Set ACBL_API_KEY on the unified ACBL API process.",
+        )
+    return ACBL_API_KEY
+
+
+def _tournament_api_get(
+    url: str, params: Optional[Dict[str, Any]] = None
+) -> requests.Response:
+    response = requests.get(
+        url,
+        params=params,
+        headers={
+            "accept": "application/json",
+            "Authorization": f"Bearer {_require_tournament_api_key()}",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+        timeout=60,
+    )
+    if not response.ok:
+        raise ClubApiError(
+            f"ACBL tournament API returned HTTP {response.status_code}",
+            status_code=502,
+            hint=response.text[:500],
+        )
+    return response
+
+
+def tournament_session_data(
+    session_id: str, refresh: bool = False
+) -> Tuple[Dict[str, Any], str]:
+    sid = str(session_id)
+    cache_file = TOURNAMENT_CACHE_DIR / f"{sid}.session.json"
+    if cache_file.is_file() and not refresh:
+        return _load_json(cache_file), "tournament API JSON cache"
+    response = _tournament_api_get(
+        "https://api.acbl.org/v1/tournament/session",
+        {"id": sid, "full_monty": 1},
+    )
+    data = response.json()
+    _save_json(cache_file, data)
+    return data, "live ACBL tournament API"
+
+
+def _historical_tournament_player_sessions(
+    player_id: str,
+) -> List[Dict[str, Any]]:
+    path = TOURNAMENT_AUGMENTED_PARQUET_FILE
+    if not path.is_file():
+        return []
+    pid = str(player_id)
+    lazy = pl.scan_parquet(path)
+    names = set(lazy.collect_schema().names())
+    player_columns = [
+        f"Player_ID_{seat}" for seat in "NESW"
+        if f"Player_ID_{seat}" in names
+    ]
+    if not player_columns or "session_id" not in names:
+        return []
+    is_ns = (
+        (pl.col("Player_ID_N").cast(pl.String) == pid)
+        | (pl.col("Player_ID_S").cast(pl.String) == pid)
+    )
+    is_ew = (
+        (pl.col("Player_ID_E").cast(pl.String) == pid)
+        | (pl.col("Player_ID_W").cast(pl.String) == pid)
+    )
+    expressions = [
+        pl.col("session_id"),
+        pl.col("Date") if "Date" in names else pl.lit(None).alias("Date"),
+        (
+            pl.col("event_name")
+            if "event_name" in names
+            else pl.lit(None).alias("event_name")
+        ),
+        (
+            pl.when(is_ns).then(pl.col("Pct_NS"))
+            .when(is_ew).then(pl.col("Pct_EW"))
+            .otherwise(None).alias("score")
+        ),
+    ]
+    frame = _collect_retry(
+        lazy.filter(is_ns | is_ew)
+        .select(expressions)
+        .group_by("session_id")
+        .agg(
+            pl.col("Date").first(),
+            pl.col("event_name").first(),
+            pl.col("score").mean(),
+        )
+        .sort("Date", descending=True)
+    )
+    if frame is None:
+        return []
+    return [
+        {
+            "session_id": row["session_id"],
+            "date": _jsonable(row.get("Date")),
+            "tournament_name": None,
+            "event_name": row.get("event_name"),
+            "session": None,
+            "score": (
+                f"{float(row['score']) * 100:.2f}%"
+                if row.get("score") is not None else None
+            ),
+            "details_url": (
+                "https://live.acbl.org/event/"
+                f"{str(row['session_id']).replace('-', '/')}/summary"
+            ),
+            "listing_source": "historical tournament augmented parquet",
+        }
+        for row in frame.to_dicts()
+    ]
+
+
+def _live_tournament_player_sessions(player_id: str) -> List[Dict[str, Any]]:
+    url: Optional[str] = (
+        "https://api.acbl.org/v1/tournament/player/history_query")
+    params: Optional[Dict[str, Any]] = {
+        "acbl_number": str(player_id),
+        "page": 1,
+        "page_size": 50,
+        "start_date": "1900-01-01",
+    }
+    rows: List[Dict[str, Any]] = []
+    while url:
+        payload = _tournament_api_get(url, params).json()
+        params = None
+        for item in payload.get("data") or []:
+            sid = str(item.get("session_id") or "")
+            if not sid:
+                continue
+            rows.append(
+                {
+                    "session_id": sid,
+                    "date": item.get("date"),
+                    "tournament_name": item.get("score_tournament_name"),
+                    "event_name": item.get("score_event_name"),
+                    "session": item.get("score_session_time_description"),
+                    "score": item.get("percentage"),
+                    "details_url": (
+                        "https://live.acbl.org/event/"
+                        f"{sid.replace('-', '/')}/summary"
+                    ),
+                    "listing_source": "live ACBL tournament API",
+                }
+            )
+        url = payload.get("next_page_url")
+    return rows
+
+
+def tournament_player_sessions(
+    player_id: str,
+    limit: Optional[int] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    pid = str(player_id).strip()
+    if not pid.isdigit():
+        raise ClubApiError(
+            "player_id must be a numeric ACBL player number", status_code=400)
+    cap = clamp_limit(limit)
+    historical = _historical_tournament_player_sessions(pid)
+    cache_file = TOURNAMENT_CACHE_DIR / f"{pid}.sessions.json"
+    live: List[Dict[str, Any]] = []
+    live_error: Optional[str] = None
+    if refresh:
+        try:
+            live = _live_tournament_player_sessions(pid)
+            _save_json(cache_file, live)
+        except (ClubApiError, requests.RequestException) as exc:
+            live_error = str(exc)
+            if cache_file.is_file():
+                live = _load_json(cache_file)
+    elif cache_file.is_file():
+        live = _load_json(cache_file)
+    if not historical and not live and not refresh:
+        try:
+            live = _live_tournament_player_sessions(pid)
+            _save_json(cache_file, live)
+        except (ClubApiError, requests.RequestException) as exc:
+            live_error = str(exc)
+    merged = {
+        str(row["session_id"]): row
+        for row in historical
+    }
+    for row in live:
+        merged[str(row["session_id"])] = row
+    rows = sorted(
+        merged.values(),
+        key=lambda row: (str(row.get("date") or ""), str(row["session_id"])),
+        reverse=True,
+    )
+    return rows_to_table(
+        rows,
+        limit=cap,
+        meta={
+            "source": "live+historical" if live and historical else (
+                "live/cache" if live else "historical parquet"),
+            "refresh_failed": live_error is not None,
+            "refresh_error": live_error,
+            "fetched_at": _now_iso() if live else _file_mtime_iso(
+                TOURNAMENT_AUGMENTED_PARQUET_FILE),
+        },
+    )
+
+
+def session_augmented_parquet(
+    session_id: str,
+    player_id: Optional[str] = None,
+    refresh: bool = False,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Resolve a complete postmortem without involving Streamlit."""
+    sid = str(session_id)
+    historical = _historical_augmented_parquet(sid)
+    if historical is not None:
+        return historical
+
+    pid = str(player_id or "").strip()
+    if not pid:
+        raise ClubApiError(
+            f"Session {sid} is absent from historical augmented parquet",
+            status_code=404,
+            hint="Pass player_id so the API can build and cache a recent session.",
+        )
+    cache_file = _postmortem_cache_file(sid, pid)
+    if cache_file.is_file() and not refresh:
+        return cache_file.read_bytes(), {
+            "source": "API-generated postmortem parquet cache",
+            "source_tier": "cache",
+            "source_file": cache_file.name,
+            "session_id": sid,
+            "player_id": pid,
+            "kind": _session_kind(sid),
+            "fetched_at": _file_mtime_iso(cache_file),
+        }
+
+    with _POSTMORTEM_BUILD_LOCK:
+        if cache_file.is_file() and not refresh:
+            return cache_file.read_bytes(), {
+                "source": "API-generated postmortem parquet cache",
+                "source_tier": "cache",
+                "source_file": cache_file.name,
+                "session_id": sid,
+                "player_id": pid,
+                "kind": _session_kind(sid),
+                "fetched_at": _file_mtime_iso(cache_file),
+            }
+        try:
+            if _session_kind(sid) == "club":
+                frames, raw_meta = session_dataframes(sid, refresh=refresh)
+                frame = build_club_postmortem(
+                    frames,
+                    pid,
+                    single_dummy_sample_count=SINGLE_DUMMY_SAMPLE_COUNT,
+                )
+                live_source = raw_meta.get("source")
+            else:
+                data, live_source = tournament_session_data(
+                    sid, refresh=refresh)
+                frame = build_tournament_postmortem(
+                    data,
+                    pid,
+                    single_dummy_sample_count=SINGLE_DUMMY_SAMPLE_COUNT,
+                )
+        except ClubApiError:
+            raise
+        except Exception as exc:
+            raise ClubApiError(
+                f"Could not build postmortem for session {sid}: {exc}",
+                status_code=422,
+            ) from exc
+        temp_file = cache_file.with_suffix(".tmp.parquet")
+        frame.write_parquet(temp_file, compression="zstd")
+        os.replace(temp_file, cache_file)
+        return cache_file.read_bytes(), {
+            "source": f"headless API build from {live_source}",
+            "source_tier": "live",
+            "source_file": cache_file.name,
+            "session_id": sid,
+            "player_id": pid,
+            "kind": _session_kind(sid),
+            "fetched_at": _now_iso(),
+        }
+
+
+_POSTMORTEM_SEATS = (
+    ("North", "NS", "S", "EW"),
+    ("South", "NS", "N", "EW"),
+    ("East", "EW", "W", "NS"),
+    ("West", "EW", "E", "NS"),
+)
+_POSTMORTEM_BOARD_COLUMNS = [
+    "Board", "Contract", "Declarer_Direction", "Declarer_ID", "Declarer_Name",
+    "Result", "Tricks", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
+    "MP_NS", "MP_EW", "MP_Top", "Par_NS", "ParContract",
+    "Pair_Number_NS", "Pair_Number_EW", "PBN",
+]
+
+
+def _personalize_postmortem(
+    frame: pl.DataFrame, player_id: str
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    pid = str(player_id).strip()
+    for player_direction, pair_direction, partner_direction, opponent_pair_direction in _POSTMORTEM_SEATS:
+        seat = player_direction[0]
+        player_col = f"Player_ID_{seat}"
+        if player_col not in frame.columns:
+            continue
+        rows = frame.filter(
+            pl.col(player_col).cast(pl.String).str.strip_chars() == pid)
+        if rows.is_empty():
+            continue
+        section_name = rows["section_name"][0]
+        pair_number = rows[f"Pair_Number_{pair_direction}"][0]
+        partner_id = rows[f"Player_ID_{partner_direction}"][0]
+        frame = frame.with_columns(
+            pl.lit(opponent_pair_direction).alias(
+                "Opponent_Pair_Direction"),
+            (pl.col("section_name") == section_name).alias("My_Section"),
+        ).with_columns(
+            pl.col("My_Section").alias("Our_Section"),
+            (
+                pl.col("My_Section")
+                & (pl.col(f"Pair_Number_{pair_direction}") == pair_number)
+            ).alias("My_Pair"),
+        ).with_columns(
+            pl.col("My_Pair").alias("Our_Pair"),
+            pl.col("My_Pair").alias("Boards_I_Played"),
+            pl.col("My_Pair").alias("Boards_We_Played"),
+            pl.col("My_Pair").alias("Our_Boards"),
+            (
+                pl.col("My_Pair")
+                & (pl.col("Declarer_ID").cast(pl.String) == pid)
+            ).alias("Boards_I_Declared"),
+            (
+                pl.col("My_Pair")
+                & (
+                    pl.col("Declarer_ID").cast(pl.String)
+                    == str(partner_id)
+                )
+            ).alias("Boards_Partner_Declared"),
+            (
+                pl.col("My_Pair")
+                & pl.col("Declarer_Direction").is_in(
+                    list(opponent_pair_direction))
+            ).alias("Boards_Opponent_Declared"),
+        ).with_columns(
+            (
+                pl.col("Boards_I_Declared")
+                | pl.col("Boards_Partner_Declared")
+            ).alias("Boards_We_Declared"),
+        )
+        return frame, {
+            "player_id": pid,
+            "player_name": rows[f"Player_Name_{seat}"][0],
+            "player_direction": player_direction,
+            "partner_id": partner_id,
+            "partner_name": rows[f"Player_Name_{partner_direction}"][0],
+            "partner_direction": partner_direction,
+            "pair_direction": pair_direction,
+            "opponent_pair_direction": opponent_pair_direction,
+            "section_name": section_name,
+            "pair_number": pair_number,
+            "game_date": (
+                str(frame["Date"].first())
+                if "Date" in frame.columns else None
+            ),
+        }
+    raise ClubApiError(
+        f"Player {pid} was not found in session", status_code=404)
+
+
+def postmortem_dataframe(
+    session_id: str,
+    player_id: str,
+    refresh: bool = False,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    payload, source_meta = session_augmented_parquet(
+        session_id, player_id=player_id, refresh=refresh)
+    frame = pl.read_parquet(io.BytesIO(payload))
+    frame, player_meta = _personalize_postmortem(frame, player_id)
+    return frame, {**source_meta, **player_meta}
+
+
+def postmortem_boards(
+    session_id: str,
+    player_id: str,
+    only_my_boards: bool = True,
+    columns: Optional[str] = None,
+    limit: Optional[int] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    frame, meta = postmortem_dataframe(
+        session_id, player_id, refresh=refresh)
+    if only_my_boards:
+        frame = frame.filter(pl.col("Boards_I_Played"))
+    wanted = (
+        [name.strip() for name in columns.split(",") if name.strip()]
+        if columns else _POSTMORTEM_BOARD_COLUMNS
+    )
+    missing = [name for name in wanted if name not in frame.columns]
+    selected = [name for name in wanted if name in frame.columns]
+    if not selected:
+        raise ClubApiError(
+            f"None of the requested columns exist: {', '.join(missing)}",
+            status_code=400,
+        )
+    if "Board" in frame.columns:
+        frame = frame.sort("Board")
+    result = dataframe_to_table(
+        frame.select(selected), limit=limit, meta=meta)
+    result["missing_columns"] = missing
+    return result
+
+
+def _postmortem_sql_macros(sql: str, meta: Dict[str, Any]) -> str:
+    for macro, key in (
+        ("{Player_Direction}", "player_direction"),
+        ("{Partner_Direction}", "partner_direction"),
+        ("{Pair_Direction}", "pair_direction"),
+        ("{Opponent_Pair_Direction}", "opponent_pair_direction"),
+    ):
+        if meta.get(key) is not None:
+            sql = sql.replace(macro, str(meta[key]))
+    return sql
+
+
+def postmortem_sql(
+    session_id: str,
+    player_id: str,
+    sql: str,
+    limit: Optional[int] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    if not sql or not sql.strip():
+        raise ClubApiError("sql is required", status_code=400)
+    frame, meta = postmortem_dataframe(
+        session_id, player_id, refresh=refresh)
+    query = _postmortem_sql_macros(sql.strip().rstrip(";"), meta)
+    if "from self" not in query.lower():
+        query = f"FROM self {query}"
+    con = duckdb.connect(config={"enable_external_access": "false"})
+    try:
+        con.register("self", frame)
+        result = con.execute(query).pl()
+    except Exception as exc:
+        raise ClubApiError(
+            f"Postmortem SQL failed: {exc}", status_code=400) from exc
+    finally:
+        con.close()
+    table = dataframe_to_table(result, limit=limit, meta=meta)
+    table["sql"] = query
+    return table
+
+
+def postmortem_schema(
+    session_id: str,
+    player_id: str,
+    pattern: Optional[str] = None,
+    limit: Optional[int] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    frame, meta = postmortem_dataframe(
+        session_id, player_id, refresh=refresh)
+    names = sorted(frame.columns)
+    if pattern:
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ClubApiError(
+                f"Invalid schema pattern: {exc}", status_code=400) from exc
+        names = [name for name in names if regex.search(name)]
+    cap = clamp_limit(limit, default=200)
+    matched = len(names)
+    names = names[:cap]
+    dtypes = dict(zip(frame.columns, (str(dtype) for dtype in frame.dtypes)))
+    return {
+        "total_columns": frame.width,
+        "matched_columns": matched,
+        "truncated": matched > cap,
+        "columns": {name: dtypes[name] for name in names},
+        "meta": _jsonable(meta),
     }
 
 

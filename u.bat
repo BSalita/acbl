@@ -2,13 +2,15 @@ rem Update the stage-1b parquets the ACBL club API needs. OneDrive syncs them
 rem to the production host, where postmortem_start.ps1 stages them into the
 rem postmortem container. Five small relationship tables support listings and
 rem lookups. The Stage 3c augmented monolith supplies complete historical
-rem postmortems without rebuilding or augmenting individual sessions.
+rem club postmortems without rebuilding or augmenting individual sessions.
+rem The tournament monolith provides the same API/MCP path for tournaments.
 xcopy e:\bridge\data\acbl\club_results_parquet\events.parquet club_results_parquet\ /D /Y
 xcopy e:\bridge\data\acbl\club_results_parquet\players.parquet club_results_parquet\ /D /Y
 xcopy e:\bridge\data\acbl\club_results_parquet\pair_summaries.parquet club_results_parquet\ /D /Y
 xcopy e:\bridge\data\acbl\club_results_parquet\sections.parquet club_results_parquet\ /D /Y
 xcopy e:\bridge\data\acbl\club_results_parquet\sessions.parquet club_results_parquet\ /D /Y
 xcopy e:\bridge\data\acbl\acbl_club_board_results_augmented.parquet club_results_parquet\ /D /Y
+xcopy e:\bridge\data\acbl\acbl_tournament_board_results_augmented.parquet club_results_parquet\ /D /Y
 if errorlevel 1 exit /b 1
 
 rem Obsolete Stage 1b reconstruction files. Recent sessions missing from the

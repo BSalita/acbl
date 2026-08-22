@@ -170,6 +170,70 @@ def acbl_session_sql(session_id: str, sql: str, limit: int = 200, refresh: bool 
     )
 
 
+@mcp.tool()
+def acbl_club_postmortem_boards(
+    player_id: str,
+    session_id: str,
+    only_my_boards: bool = True,
+    columns: Optional[str] = None,
+    limit: int = 100,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    """Augmented club board results from historical parquet, API parquet
+    cache, or a live headless API build. Prefer this over raw session tables
+    for game highlights."""
+    return _club_get(
+        f"/postmortems/{session_id}/boards",
+        {
+            "player_id": player_id,
+            "only_my_boards": only_my_boards,
+            "columns": columns,
+            "limit": limit,
+            "refresh": refresh,
+        },
+    )
+
+
+@mcp.tool()
+def acbl_club_postmortem_sql(
+    player_id: str,
+    session_id: str,
+    sql: str,
+    limit: int = 500,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    """DuckDB SQL against the fully augmented club postmortem table `self`."""
+    return _club_get(
+        f"/postmortems/{session_id}/sql",
+        {
+            "player_id": player_id,
+            "sql": sql,
+            "limit": limit,
+            "refresh": refresh,
+        },
+    )
+
+
+@mcp.tool()
+def acbl_club_postmortem_schema(
+    player_id: str,
+    session_id: str,
+    pattern: Optional[str] = None,
+    limit: int = 200,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    """Search columns and dtypes in a fully augmented club postmortem."""
+    return _club_get(
+        f"/postmortems/{session_id}/schema",
+        {
+            "player_id": player_id,
+            "pattern": pattern,
+            "limit": limit,
+            "refresh": refresh,
+        },
+    )
+
+
 if __name__ == "__main__":
     print(
         f"[acbl-club-mcp] starting on :{ACBL_CLUB_MCP_PORT} "
