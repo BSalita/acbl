@@ -62,7 +62,8 @@ def get_tournament_dataset_info() -> dict:
 
 
 @app.get("/clubs/info")
-def get_club_dataset_info() -> dict:
+def get_club_dataset_info(response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
     return {
         "status": "ok",
         "service": "acbl-results-api",

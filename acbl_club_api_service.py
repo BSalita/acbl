@@ -169,13 +169,18 @@ _AUGMENTED_SESSION_CACHE: Dict[Tuple[str, float], bytes] = {}
 _AUGMENTED_SESSION_LOCK = threading.Lock()
 _AUGMENTED_SESSION_MAX = 8
 _POSTMORTEM_BUILD_LOCK = threading.Lock()
+_POSTMORTEM_CACHE_VERSION = 2
 _TOURNAMENT_PARQUET_HITS = 0
 _TOURNAMENT_PARQUET_MISSES = 0
 _LAST_TOURNAMENT_API_SUCCESS: Optional[str] = None
+_LAST_TOURNAMENT_PARQUET_QUERY: Optional[Dict[str, Any]] = None
+_RECENT_TOURNAMENT_PARQUET_SESSIONS: List[str] = []
 _CLUB_PARQUET_HITS = 0
 _CLUB_PARQUET_MISSES = 0
 _LAST_CLUB_PARQUET_QUERY: Optional[Dict[str, Any]] = None
 _RECENT_CLUB_PARQUET_SESSIONS: List[str] = []
+_CLUB_METRICS_FILE = POSTMORTEM_CACHE_DIR / "_club_parquet_metrics.json"
+_CLUB_METRICS_LOCK = threading.Lock()
 
 
 class ClubApiError(Exception):
@@ -458,6 +463,7 @@ def dataset_info() -> Dict[str, Any]:
 def club_dataset_info() -> Dict[str, Any]:
     """Club-specific parquet and cache availability."""
     path = AUGMENTED_PARQUET_FILE
+    metrics = _club_metrics_snapshot()
     cached_files = list(POSTMORTEM_CACHE_DIR.glob("*.parquet"))
     cached_ids = sorted({
         item.stem.rsplit("-", 1)[0]
@@ -470,12 +476,13 @@ def club_dataset_info() -> Dict[str, Any]:
         "club_parquet_updated_at": (
             _file_mtime_iso(path) if path.is_file() else None
         ),
-        "club_parquet_hits": _CLUB_PARQUET_HITS,
-        "club_parquet_misses": _CLUB_PARQUET_MISSES,
-        "last_club_parquet_query": _LAST_CLUB_PARQUET_QUERY,
-        "recent_club_parquet_sessions": list(_RECENT_CLUB_PARQUET_SESSIONS),
-        "cached_club_postmortems": len(cached_ids),
-        "cached_club_postmortem_ids": cached_ids,
+        "club_parquet_hits": metrics["hits"],
+        "club_parquet_misses": metrics["misses"],
+        "last_club_parquet_query": metrics["last_query"],
+        "historical_parquet_sessions_recently_served": metrics[
+            "recent_sessions"],
+        "generated_club_postmortem_cache_count": len(cached_ids),
+        "generated_club_postmortem_cache_ids": cached_ids,
         "raw_json_cached_sessions": cached_session_count(),
         "archive_dir": (
             str(ARCHIVE_CACHE_DIR) if ARCHIVE_CACHE_DIR.is_dir() else None
@@ -488,23 +495,56 @@ def club_dataset_info() -> Dict[str, Any]:
     }
 
 
+def _club_metrics_snapshot() -> Dict[str, Any]:
+    fallback = {
+        "hits": _CLUB_PARQUET_HITS,
+        "misses": _CLUB_PARQUET_MISSES,
+        "last_query": _LAST_CLUB_PARQUET_QUERY,
+        "recent_sessions": list(_RECENT_CLUB_PARQUET_SESSIONS),
+    }
+    if not _CLUB_METRICS_FILE.is_file():
+        return fallback
+    try:
+        stored = json.loads(_CLUB_METRICS_FILE.read_text(encoding="utf-8"))
+        return {
+            "hits": int(stored.get("hits", fallback["hits"])),
+            "misses": int(stored.get("misses", fallback["misses"])),
+            "last_query": stored.get("last_query"),
+            "recent_sessions": list(stored.get("recent_sessions") or []),
+        }
+    except (OSError, ValueError, TypeError):
+        return fallback
+
+
 def _record_club_parquet_query(session_id: str, hit: bool) -> None:
     global _CLUB_PARQUET_HITS, _CLUB_PARQUET_MISSES
     global _LAST_CLUB_PARQUET_QUERY
-    if hit:
-        _CLUB_PARQUET_HITS += 1
-        sid = str(session_id)
-        if sid in _RECENT_CLUB_PARQUET_SESSIONS:
-            _RECENT_CLUB_PARQUET_SESSIONS.remove(sid)
-        _RECENT_CLUB_PARQUET_SESSIONS.insert(0, sid)
-        del _RECENT_CLUB_PARQUET_SESSIONS[20:]
-    else:
-        _CLUB_PARQUET_MISSES += 1
-    _LAST_CLUB_PARQUET_QUERY = {
-        "session_id": str(session_id),
-        "hit": hit,
-        "queried_at": _now_iso(),
-    }
+    with _CLUB_METRICS_LOCK:
+        stored = _club_metrics_snapshot()
+        if hit:
+            _CLUB_PARQUET_HITS += 1
+            stored["hits"] += 1
+            sid = str(session_id)
+            recent = stored["recent_sessions"]
+            if sid in recent:
+                recent.remove(sid)
+            recent.insert(0, sid)
+            del recent[20:]
+            _RECENT_CLUB_PARQUET_SESSIONS[:] = recent
+        else:
+            _CLUB_PARQUET_MISSES += 1
+            stored["misses"] += 1
+        query = {
+            "session_id": str(session_id),
+            "hit": hit,
+            "queried_at": _now_iso(),
+        }
+        _LAST_CLUB_PARQUET_QUERY = query
+        stored["last_query"] = query
+        temp_file = _CLUB_METRICS_FILE.with_suffix(".tmp")
+        temp_file.write_text(
+            json.dumps(stored, indent=2), encoding="utf-8")
+        os.replace(temp_file, _CLUB_METRICS_FILE)
 
 
 def tournament_dataset_info() -> Dict[str, Any]:
@@ -535,6 +575,9 @@ def tournament_dataset_info() -> Dict[str, Any]:
         ),
         "tournament_parquet_hits": _TOURNAMENT_PARQUET_HITS,
         "tournament_parquet_misses": _TOURNAMENT_PARQUET_MISSES,
+        "last_tournament_parquet_query": _LAST_TOURNAMENT_PARQUET_QUERY,
+        "recent_tournament_parquet_sessions": list(
+            _RECENT_TOURNAMENT_PARQUET_SESSIONS),
         "cached_tournament_sessions": len(session_caches),
         "cached_tournament_player_listings": len(listing_caches),
         "cached_tournament_postmortems": len(postmortem_caches),
@@ -548,6 +591,25 @@ def tournament_dataset_info() -> Dict[str, Any]:
             "Official ACBL API access is limited to uncached pair sessions; "
             "team and knockout sessions are reported as having no board results."
         ),
+    }
+
+
+def _record_tournament_parquet_query(session_id: str, hit: bool) -> None:
+    global _TOURNAMENT_PARQUET_HITS, _TOURNAMENT_PARQUET_MISSES
+    global _LAST_TOURNAMENT_PARQUET_QUERY
+    if hit:
+        _TOURNAMENT_PARQUET_HITS += 1
+        sid = str(session_id)
+        if sid in _RECENT_TOURNAMENT_PARQUET_SESSIONS:
+            _RECENT_TOURNAMENT_PARQUET_SESSIONS.remove(sid)
+        _RECENT_TOURNAMENT_PARQUET_SESSIONS.insert(0, sid)
+        del _RECENT_TOURNAMENT_PARQUET_SESSIONS[20:]
+    else:
+        _TOURNAMENT_PARQUET_MISSES += 1
+    _LAST_TOURNAMENT_PARQUET_QUERY = {
+        "session_id": str(session_id),
+        "hit": hit,
+        "queried_at": _now_iso(),
     }
 
 
@@ -1310,7 +1372,6 @@ def _session_kind(session_id: str) -> str:
 def _historical_augmented_parquet(
     session_id: str,
 ) -> Optional[Tuple[bytes, Dict[str, Any]]]:
-    global _TOURNAMENT_PARQUET_HITS, _TOURNAMENT_PARQUET_MISSES
     sid = str(session_id)
     kind = _session_kind(sid)
     path = (
@@ -1346,7 +1407,7 @@ def _historical_augmented_parquet(
             )
         if frame.is_empty():
             if kind == "tournament":
-                _TOURNAMENT_PARQUET_MISSES += 1
+                _record_tournament_parquet_query(sid, False)
             else:
                 _record_club_parquet_query(sid, False)
             return None
@@ -1359,7 +1420,7 @@ def _historical_augmented_parquet(
                     next(iter(_AUGMENTED_SESSION_CACHE)))
             _AUGMENTED_SESSION_CACHE[key] = cached
     if kind == "tournament":
-        _TOURNAMENT_PARQUET_HITS += 1
+        _record_tournament_parquet_query(sid, True)
     else:
         _record_club_parquet_query(sid, True)
     return cached, {
@@ -1379,7 +1440,7 @@ def _postmortem_cache_file(session_id: str, player_id: str) -> pathlib.Path:
 
 
 def _validated_postmortem_cache(
-    cache_file: pathlib.Path, player_id: str
+    cache_file: pathlib.Path, player_id: str, session_id: str
 ) -> Optional[bytes]:
     """Normalize legacy float IDs and reject caches for the wrong player."""
     try:
@@ -1387,6 +1448,18 @@ def _validated_postmortem_cache(
     except Exception:
         cache_file.unlink(missing_ok=True)
         return None
+    if _session_kind(session_id) == "tournament":
+        if "_api_cache_version" not in frame.columns or not (
+            (
+                frame.get_column("_api_cache_version").drop_nulls()
+                == _POSTMORTEM_CACHE_VERSION
+            ).all()
+        ):
+            # Version 1 tournament caches rotated already-given-first names
+            # (Robert Salita -> Salita Robert). Rebuild once from the official
+            # API rather than attempting an ambiguous name heuristic.
+            cache_file.unlink(missing_ok=True)
+            return None
     player_columns = [
         name for name in (f"Player_ID_{seat}" for seat in "NESW")
         if name in frame.columns
@@ -1668,8 +1741,28 @@ def tournament_player_sessions(
     merged = {str(row["session_id"]): row for row in live}
     # Historical rows are known to have board-level postmortems and must not
     # be relabeled as live merely because the listing API also returned them.
+    # The official player-history percentage is the published session result;
+    # averaging board percentages from the augmented rows is only an estimate.
     for row in historical:
-        merged[str(row["session_id"])] = row
+        sid = str(row["session_id"])
+        official = merged.get(sid)
+        if official is not None:
+            row = {
+                **row,
+                "score": official.get("score"),
+                "score_source": "official ACBL tournament player history",
+                "parquet_board_average": row.get("score"),
+                "tournament_name": official.get("tournament_name"),
+                "session": official.get("session"),
+                "event_type": official.get("event_type") or row.get("event_type"),
+                "unavailable_reason": None,
+            }
+        else:
+            row = {
+                **row,
+                "score_source": "mean board percentage from historical parquet",
+            }
+        merged[sid] = row
     rows = sorted(
         merged.values(),
         key=lambda row: (str(row.get("date") or ""), str(row["session_id"])),
@@ -1701,6 +1794,24 @@ def _cached_tournament_listing(
     return None
 
 
+def _with_tournament_listing_meta(
+    meta: Dict[str, Any], player_id: str, session_id: str
+) -> Dict[str, Any]:
+    if _session_kind(session_id) != "tournament":
+        return meta
+    listing = _cached_tournament_listing(player_id, session_id)
+    if listing is None:
+        return meta
+    return {
+        **meta,
+        "official_session_score": listing.get("score"),
+        "score_source": "official ACBL tournament player history",
+        "tournament_name": listing.get("tournament_name"),
+        "event_name": listing.get("event_name"),
+        "session": listing.get("session"),
+    }
+
+
 def session_augmented_parquet(
     session_id: str,
     player_id: Optional[str] = None,
@@ -1722,7 +1833,7 @@ def session_augmented_parquet(
         )
     cache_file = _postmortem_cache_file(sid, pid)
     if cache_file.is_file() and not refresh:
-        cached = _validated_postmortem_cache(cache_file, pid)
+        cached = _validated_postmortem_cache(cache_file, pid, sid)
         if cached is not None:
             return cached, {
                 "source": "API-generated postmortem parquet cache",
@@ -1742,7 +1853,7 @@ def session_augmented_parquet(
 
     with _POSTMORTEM_BUILD_LOCK:
         if cache_file.is_file() and not refresh:
-            cached = _validated_postmortem_cache(cache_file, pid)
+            cached = _validated_postmortem_cache(cache_file, pid, sid)
             if cached is not None:
                 return cached, {
                     "source": "API-generated postmortem parquet cache",
@@ -1798,6 +1909,8 @@ def session_augmented_parquet(
                 f"Could not build postmortem for session {sid}: {exc}",
                 status_code=422,
             ) from exc
+        frame = frame.with_columns(
+            pl.lit(_POSTMORTEM_CACHE_VERSION).alias("_api_cache_version"))
         temp_file = cache_file.with_suffix(".tmp.parquet")
         frame.write_parquet(temp_file, compression="zstd")
         os.replace(temp_file, cache_file)
@@ -1918,6 +2031,25 @@ def _normalize_postmortem_frame(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(expressions) if expressions else frame
 
 
+def _scale_percentage_columns(frame: pl.DataFrame) -> pl.DataFrame:
+    expressions = []
+    for name in frame.columns:
+        lowered = name.lower()
+        if not (
+            lowered.startswith("pct_")
+            or lowered.endswith("_pct")
+            or "percentage" in lowered
+        ):
+            continue
+        column = frame.get_column(name)
+        if not column.dtype.is_numeric():
+            continue
+        maximum = column.max()
+        if maximum is not None and float(maximum) <= 1.0:
+            expressions.append((pl.col(name) * 100).alias(name))
+    return frame.with_columns(expressions) if expressions else frame
+
+
 def _personalize_postmortem(
     frame: pl.DataFrame, player_id: str
 ) -> Tuple[pl.DataFrame, Dict[str, Any]]:
@@ -2005,7 +2137,9 @@ def postmortem_dataframe(
     frame = _normalize_postmortem_frame(
         pl.read_parquet(io.BytesIO(payload)))
     frame, player_meta = _personalize_postmortem(frame, player_id)
-    return frame, {**source_meta, **player_meta}
+    meta = _with_tournament_listing_meta(
+        {**source_meta, **player_meta}, player_id, session_id)
+    return frame, meta
 
 
 def postmortem_boards(
@@ -2016,7 +2150,6 @@ def postmortem_boards(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
-    global _TOURNAMENT_PARQUET_HITS
     wanted = (
         [name.strip() for name in columns.split(",") if name.strip()]
         if columns else _POSTMORTEM_BOARD_COLUMNS
@@ -2041,11 +2174,12 @@ def postmortem_boards(
         else:
             frame = _normalize_postmortem_frame(frame)
             if source_meta.get("kind") == "tournament":
-                _TOURNAMENT_PARQUET_HITS += 1
+                _record_tournament_parquet_query(session_id, True)
             else:
                 _record_club_parquet_query(session_id, True)
             frame, player_meta = _personalize_postmortem(frame, player_id)
-            meta = {**source_meta, **player_meta}
+            meta = _with_tournament_listing_meta(
+                {**source_meta, **player_meta}, player_id, session_id)
     else:
         frame, meta = postmortem_dataframe(
             session_id, player_id, refresh=refresh)
@@ -2114,8 +2248,9 @@ def postmortem_sql(
             f"Postmortem SQL failed: {exc}", status_code=400) from exc
     finally:
         con.close()
+    result = _scale_percentage_columns(result)
     table = dataframe_to_table(result, limit=limit, meta=meta)
-    table["meta"]["percentage_scale"] = "0-1"
+    table["meta"]["percentage_scale"] = "0-100"
     table["sql"] = query
     return table
 
@@ -2127,7 +2262,6 @@ def postmortem_schema(
     limit: Optional[int] = None,
     refresh: bool = False,
 ) -> Dict[str, Any]:
-    global _TOURNAMENT_PARQUET_HITS
     historical = _historical_postmortem_lazy(session_id)
     if historical is not None:
         lazy, source_meta = historical
@@ -2150,12 +2284,13 @@ def postmortem_schema(
         else:
             context = _normalize_postmortem_frame(context)
             if source_meta.get("kind") == "tournament":
-                _TOURNAMENT_PARQUET_HITS += 1
+                _record_tournament_parquet_query(session_id, True)
             else:
                 _record_club_parquet_query(session_id, True)
             _context, player_meta = _personalize_postmortem(
                 context, player_id)
-            meta = {**source_meta, **player_meta}
+            meta = _with_tournament_listing_meta(
+                {**source_meta, **player_meta}, player_id, session_id)
             dtypes = {
                 name: str(dtype)
                 for name, dtype in zip(schema.names(), schema.dtypes())
