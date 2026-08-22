@@ -121,6 +121,14 @@ def get_player_games(
     return svc.player_games(player_id, limit=limit, refresh=refresh)
 
 
+@app.get("/clubs/players/{player_id}/postmortems")
+def get_historical_club_player_sessions(
+    player_id: str,
+    limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
+) -> dict:
+    return svc.historical_club_player_sessions(player_id, limit=limit)
+
+
 @app.get("/tournaments/players/{player_id}/sessions")
 def get_tournament_player_sessions(
     player_id: str,

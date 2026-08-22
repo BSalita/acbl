@@ -1564,6 +1564,107 @@ def tournament_session_data(
     return data, "live ACBL tournament API"
 
 
+def historical_club_player_sessions(
+    player_id: str, limit: Optional[int] = None
+) -> Dict[str, Any]:
+    """Club sessions for a player that are guaranteed present in the monolith."""
+    pid = str(player_id).strip()
+    if not pid.isdigit():
+        raise ClubApiError(
+            "player_id must be a numeric ACBL player number", status_code=400)
+    path = AUGMENTED_PARQUET_FILE
+    if not path.is_file():
+        raise ClubApiError(
+            "Club augmented parquet is unavailable", status_code=503)
+    lazy = pl.scan_parquet(path)
+    names = set(lazy.collect_schema().names())
+    player_columns = [
+        f"Player_ID_{seat}" for seat in "NESW"
+        if f"Player_ID_{seat}" in names
+    ]
+    if "event_id" not in names or not player_columns:
+        raise ClubApiError(
+            "Club augmented parquet lacks session/player columns",
+            status_code=500,
+        )
+    seat_matches = {
+        seat: pl.col(f"Player_ID_{seat}").cast(pl.String) == pid
+        for seat in "NESW"
+        if f"Player_ID_{seat}" in names
+    }
+    player_match = pl.any_horizontal(list(seat_matches.values()))
+    pair_score = (
+        pl.when(
+            seat_matches.get("N", pl.lit(False))
+            | seat_matches.get("S", pl.lit(False))
+        ).then(pl.col("Pct_NS"))
+        .when(
+            seat_matches.get("E", pl.lit(False))
+            | seat_matches.get("W", pl.lit(False))
+        ).then(pl.col("Pct_EW"))
+        .otherwise(None)
+    )
+    expressions = [
+        pl.col("event_id").cast(pl.String).alias("session_id"),
+        pl.col("Date") if "Date" in names else pl.lit(None).alias("Date"),
+        (
+            pl.col("club_name")
+            if "club_name" in names else pl.lit(None).alias("club_name")
+        ),
+        (
+            pl.col("event_name")
+            if "event_name" in names else pl.lit(None).alias("event_name")
+        ),
+        pair_score.alias("score"),
+    ]
+    frame = _collect_retry(
+        lazy.filter(player_match)
+        .select(expressions)
+        .group_by("session_id")
+        .agg(
+            pl.col("Date").first(),
+            pl.col("club_name").first(),
+            pl.col("event_name").first(),
+            (pl.col("score").mean() * 100).alias("score"),
+        )
+        .sort("Date", descending=True)
+        .limit(clamp_limit(limit))
+    )
+    if frame is None:
+        raise ClubApiError(
+            "Could not read historical club postmortem sessions",
+            status_code=503,
+        )
+    rows = [
+        {
+            "session_id": row["session_id"],
+            "date": _jsonable(row.get("Date")),
+            "club_name": row.get("club_name"),
+            "event": row.get("event_name"),
+            "session": None,
+            "score": (
+                f"{float(row['score']):.2f}%"
+                if row.get("score") is not None else None
+            ),
+            "details_url": (
+                f"{ACBL_ORIGIN}/club-results/details/{row['session_id']}"
+            ),
+            "listing_source": "historical club augmented parquet",
+            "boards": True,
+        }
+        for row in frame.to_dicts()
+    ]
+    return rows_to_table(
+        rows,
+        limit=clamp_limit(limit),
+        meta={
+            "source": "historical club augmented parquet",
+            "source_file": path.name,
+            "fetched_at": _file_mtime_iso(path),
+        },
+    )
+
+
 def _historical_tournament_player_sessions(
     player_id: str,
 ) -> List[Dict[str, Any]]:
