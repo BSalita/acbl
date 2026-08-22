@@ -172,6 +172,10 @@ _POSTMORTEM_BUILD_LOCK = threading.Lock()
 _TOURNAMENT_PARQUET_HITS = 0
 _TOURNAMENT_PARQUET_MISSES = 0
 _LAST_TOURNAMENT_API_SUCCESS: Optional[str] = None
+_CLUB_PARQUET_HITS = 0
+_CLUB_PARQUET_MISSES = 0
+_LAST_CLUB_PARQUET_QUERY: Optional[Dict[str, Any]] = None
+_RECENT_CLUB_PARQUET_SESSIONS: List[str] = []
 
 
 class ClubApiError(Exception):
@@ -449,6 +453,58 @@ def dataset_info() -> Dict[str, Any]:
     }
     _dataset_info_cache = (now, info)
     return info
+
+
+def club_dataset_info() -> Dict[str, Any]:
+    """Club-specific parquet and cache availability."""
+    path = AUGMENTED_PARQUET_FILE
+    cached_files = list(POSTMORTEM_CACHE_DIR.glob("*.parquet"))
+    cached_ids = sorted({
+        item.stem.rsplit("-", 1)[0]
+        for item in cached_files
+        if item.stem.rsplit("-", 1)[0].isdigit()
+    })
+    return {
+        "club_augmented_parquet": str(path) if path.is_file() else None,
+        "club_parquet_size_bytes": path.stat().st_size if path.is_file() else None,
+        "club_parquet_updated_at": (
+            _file_mtime_iso(path) if path.is_file() else None
+        ),
+        "club_parquet_hits": _CLUB_PARQUET_HITS,
+        "club_parquet_misses": _CLUB_PARQUET_MISSES,
+        "last_club_parquet_query": _LAST_CLUB_PARQUET_QUERY,
+        "recent_club_parquet_sessions": list(_RECENT_CLUB_PARQUET_SESSIONS),
+        "cached_club_postmortems": len(cached_ids),
+        "cached_club_postmortem_ids": cached_ids,
+        "raw_json_cached_sessions": cached_session_count(),
+        "archive_dir": (
+            str(ARCHIVE_CACHE_DIR) if ARCHIVE_CACHE_DIR.is_dir() else None
+        ),
+        "note": (
+            "Historical session tables and postmortems are projected from the "
+            "club augmented parquet. Raw JSON is only used for recent sessions "
+            "that are absent from that parquet."
+        ),
+    }
+
+
+def _record_club_parquet_query(session_id: str, hit: bool) -> None:
+    global _CLUB_PARQUET_HITS, _CLUB_PARQUET_MISSES
+    global _LAST_CLUB_PARQUET_QUERY
+    if hit:
+        _CLUB_PARQUET_HITS += 1
+        sid = str(session_id)
+        if sid in _RECENT_CLUB_PARQUET_SESSIONS:
+            _RECENT_CLUB_PARQUET_SESSIONS.remove(sid)
+        _RECENT_CLUB_PARQUET_SESSIONS.insert(0, sid)
+        del _RECENT_CLUB_PARQUET_SESSIONS[20:]
+    else:
+        _CLUB_PARQUET_MISSES += 1
+    _LAST_CLUB_PARQUET_QUERY = {
+        "session_id": str(session_id),
+        "hit": hit,
+        "queried_at": _now_iso(),
+    }
 
 
 def tournament_dataset_info() -> Dict[str, Any]:
@@ -1291,6 +1347,8 @@ def _historical_augmented_parquet(
         if frame.is_empty():
             if kind == "tournament":
                 _TOURNAMENT_PARQUET_MISSES += 1
+            else:
+                _record_club_parquet_query(sid, False)
             return None
         output = io.BytesIO()
         frame.write_parquet(output, compression="zstd")
@@ -1302,6 +1360,8 @@ def _historical_augmented_parquet(
             _AUGMENTED_SESSION_CACHE[key] = cached
     if kind == "tournament":
         _TOURNAMENT_PARQUET_HITS += 1
+    else:
+        _record_club_parquet_query(sid, True)
     return cached, {
         "source": f"historical {kind} augmented parquet",
         "source_tier": "historical",
@@ -1766,6 +1826,7 @@ _POSTMORTEM_BOARD_COLUMNS = [
 ]
 _POSTMORTEM_CONTEXT_COLUMNS = [
     "section_name", "Date", "Declarer_ID", "Declarer_Direction",
+    "result", "tricks_taken",
     "Pair_Number_NS", "Pair_Number_EW",
     *(f"Player_ID_{seat}" for seat in "NESW"),
     *(f"Player_Name_{seat}" for seat in "NESW"),
@@ -1814,6 +1875,47 @@ def _historical_postmortem_lazy(
         "kind": kind,
         "fetched_at": _file_mtime_iso(path),
     }
+
+
+def _given_name_first(value: Any) -> Any:
+    if not isinstance(value, str) or "," not in value:
+        return value
+    last, first = value.split(",", 1)
+    return f"{first.strip()} {last.strip()}".strip()
+
+
+def _normalize_postmortem_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """Normalize API presentation fields without changing the monolith."""
+    name_columns = [
+        name for name in [
+            *(f"Player_Name_{seat}" for seat in "NESW"),
+            "Declarer_Name",
+        ]
+        if name in frame.columns
+    ]
+    expressions: List[pl.Expr] = [
+        pl.col(name)
+        .map_elements(_given_name_first, return_dtype=pl.String)
+        .alias(name)
+        for name in name_columns
+    ]
+    if "tricks_taken" in frame.columns and "Tricks" in frame.columns:
+        raw_tricks = pl.col("tricks_taken").cast(pl.Int16, strict=False)
+        expressions.append(
+            pl.when(raw_tricks.is_not_null())
+            .then(raw_tricks)
+            .otherwise(pl.col("Tricks"))
+            .alias("Tricks")
+        )
+    if "result" in frame.columns and "Result" in frame.columns:
+        raw_result = pl.col("result").cast(pl.Int16, strict=False)
+        expressions.append(
+            pl.when(raw_result.is_not_null())
+            .then(raw_result)
+            .otherwise(pl.col("Result"))
+            .alias("Result")
+        )
+    return frame.with_columns(expressions) if expressions else frame
 
 
 def _personalize_postmortem(
@@ -1900,7 +2002,8 @@ def postmortem_dataframe(
         refresh=refresh,
         allow_build=_session_kind(session_id) == "tournament",
     )
-    frame = pl.read_parquet(io.BytesIO(payload))
+    frame = _normalize_postmortem_frame(
+        pl.read_parquet(io.BytesIO(payload)))
     frame, player_meta = _personalize_postmortem(frame, player_id)
     return frame, {**source_meta, **player_meta}
 
@@ -1936,8 +2039,11 @@ def postmortem_boards(
             frame, meta = postmortem_dataframe(
                 session_id, player_id, refresh=refresh)
         else:
+            frame = _normalize_postmortem_frame(frame)
             if source_meta.get("kind") == "tournament":
                 _TOURNAMENT_PARQUET_HITS += 1
+            else:
+                _record_club_parquet_query(session_id, True)
             frame, player_meta = _personalize_postmortem(frame, player_id)
             meta = {**source_meta, **player_meta}
     else:
@@ -1945,7 +2051,7 @@ def postmortem_boards(
             session_id, player_id, refresh=refresh)
     if only_my_boards:
         frame = frame.filter(pl.col("Boards_I_Played"))
-    if meta.get("kind") == "tournament" and not frame.is_empty():
+    if not frame.is_empty():
         percent_columns = [
             name for name in ("Pct_NS", "Pct_EW")
             if name in frame.columns
@@ -1957,6 +2063,7 @@ def postmortem_boards(
                 (pl.col(name) * 100).alias(name)
                 for name in percent_columns
             )
+    meta = {**meta, "percentage_scale": "0-100"}
     missing = [name for name in wanted if name not in frame.columns]
     selected = [name for name in wanted if name in frame.columns]
     if not selected:
@@ -2008,6 +2115,7 @@ def postmortem_sql(
     finally:
         con.close()
     table = dataframe_to_table(result, limit=limit, meta=meta)
+    table["meta"]["percentage_scale"] = "0-1"
     table["sql"] = query
     return table
 
@@ -2040,8 +2148,11 @@ def postmortem_schema(
             dtypes = dict(zip(
                 frame.columns, (str(dtype) for dtype in frame.dtypes)))
         else:
+            context = _normalize_postmortem_frame(context)
             if source_meta.get("kind") == "tournament":
                 _TOURNAMENT_PARQUET_HITS += 1
+            else:
+                _record_club_parquet_query(session_id, True)
             _context, player_meta = _personalize_postmortem(
                 context, player_id)
             meta = {**source_meta, **player_meta}
@@ -2313,6 +2424,113 @@ def session_frames_from_json(data: Dict[str, Any]) -> Dict[str, pl.DataFrame]:
     return dfs
 
 
+def session_frames_from_augmented_parquet(
+    session_id: str,
+) -> Optional[Tuple[Dict[str, pl.DataFrame], Dict[str, Any]]]:
+    """Project useful historical session tables from the augmented monolith."""
+    historical = _historical_postmortem_lazy(session_id)
+    if historical is None:
+        return None
+    lazy, source_meta = historical
+    if source_meta.get("kind") != "club":
+        return None
+    available = lazy.collect_schema().names()
+    wanted = [
+        "event_id", "session_id", "Date", "club_id", "club_name",
+        "event_name", "section_name", "Board", "Contract", "Result", "result",
+        "Tricks", "tricks_taken", "Declarer_Direction", "Declarer_ID",
+        "Declarer_Name", "Score_NS", "Score_EW", "Pct_NS", "Pct_EW",
+        "MP_NS", "MP_EW", "MP_Top", "Pair_Number_NS", "Pair_Number_EW",
+        "PBN", "Vul", "Vul_NS", "Vul_EW", "DD_Tricks",
+        *(f"Player_ID_{seat}" for seat in "NESW"),
+        *(f"Player_Name_{seat}" for seat in "NESW"),
+    ]
+    selected = [name for name in wanted if name in available]
+    frame = _collect_retry(lazy.select(selected))
+    if frame is None:
+        raise ClubApiError(
+            f"Could not read historical session {session_id}",
+            status_code=503,
+        )
+    if frame.is_empty():
+        _record_club_parquet_query(session_id, False)
+        return None
+    _record_club_parquet_query(session_id, True)
+    frame = _normalize_postmortem_frame(frame)
+
+    event_columns = [
+        name for name in (
+            "event_id", "session_id", "Date", "club_id", "club_name",
+            "event_name",
+        )
+        if name in frame.columns
+    ]
+    event = frame.select(event_columns).unique(maintain_order=True).head(1)
+    sections = frame.select([
+        name for name in ("event_id", "session_id", "section_name")
+        if name in frame.columns
+    ]).unique(maintain_order=True)
+    boards = frame.select([
+        name for name in ("event_id", "session_id", "section_name", "Board")
+        if name in frame.columns
+    ]).unique(maintain_order=True).sort(
+        [name for name in ("section_name", "Board") if name in frame.columns]
+    )
+
+    pair_frames: List[pl.DataFrame] = []
+    for direction, seats in (("NS", "NS"), ("EW", "EW")):
+        required = [
+            "section_name", f"Pair_Number_{direction}",
+            *(f"Player_ID_{seat}" for seat in seats),
+            *(f"Player_Name_{seat}" for seat in seats),
+        ]
+        if all(name in frame.columns for name in required):
+            percentage = f"Pct_{direction}"
+            pair_frames.append(
+                frame.group_by(required, maintain_order=True).agg(
+                    (pl.col(percentage).mean() * 100).alias("percentage")
+                    if percentage in frame.columns
+                    else pl.lit(None).alias("percentage")
+                ).with_columns(
+                    pl.lit(direction).alias("pair_direction")
+                ).rename({
+                    f"Pair_Number_{direction}": "pair_number",
+                    f"Player_ID_{seats[0]}": "player_id_1",
+                    f"Player_ID_{seats[1]}": "player_id_2",
+                    f"Player_Name_{seats[0]}": "player_name_1",
+                    f"Player_Name_{seats[1]}": "player_name_2",
+                })
+            )
+    pair_summaries = (
+        pl.concat(pair_frames, how="diagonal_relaxed")
+        if pair_frames else pl.DataFrame()
+    )
+    hand_records = (
+        frame.select(["Board", "PBN"]).unique(maintain_order=True)
+        if {"Board", "PBN"}.issubset(frame.columns)
+        else pl.DataFrame()
+    )
+    dfs = {
+        "event": event,
+        "sections": sections,
+        "boards": boards,
+        "board_results": frame,
+        "pair_summaries": pair_summaries,
+        "standings": pair_summaries,
+        "hand_records": hand_records,
+        "postmortem": frame,
+    }
+    return dfs, {
+        **source_meta,
+        "source": "historical augmented parquet projection",
+        "cached": True,
+        "table_semantics": (
+            "Projected analytical tables; not the original raw JSON schema."
+        ),
+        "percentage_scale": "0-100 for projected pair summaries/standings",
+    }
+
+
 def session_dataframes(
     session_id: str,
     refresh: bool = False,
@@ -2352,6 +2570,9 @@ def session_dataframes(
                 "start_date": event.get("start_date"),
                 "cache_file": None,
             }
+        augmented = session_frames_from_augmented_parquet(session_id)
+        if augmented is not None:
+            return augmented
 
     data, cached, path = _fetch_session_json(
         session_id, refresh=refresh, allow_live=allow_live)

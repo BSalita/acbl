@@ -67,9 +67,8 @@ async def health(request: Request) -> JSONResponse:
 
 @mcp.tool()
 def acbl_dataset_info() -> Dict[str, Any]:
-    """Cache directory, cached club-session count, and whether a Chrome
-    profile is configured on the ACBL club-results API."""
-    return _club_get("/health")
+    """Club parquet, projected historical tables, and API cache availability."""
+    return _club_get("/clubs/info")
 
 
 @mcp.tool()

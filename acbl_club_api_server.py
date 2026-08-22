@@ -61,6 +61,15 @@ def get_tournament_dataset_info() -> dict:
     }
 
 
+@app.get("/clubs/info")
+def get_club_dataset_info() -> dict:
+    return {
+        "status": "ok",
+        "service": "acbl-results-api",
+        **svc.club_dataset_info(),
+    }
+
+
 @app.get("/clubs")
 def get_clubs(
     q: Optional[str] = Query(None, description="Substring filter on club id/name/location"),
