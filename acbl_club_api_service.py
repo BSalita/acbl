@@ -29,6 +29,7 @@ import polars as pl
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from rapidfuzz import fuzz
 
 _APP_DIR = pathlib.Path(__file__).resolve().parent
 _SRC_DIR = _APP_DIR.parent
@@ -3048,9 +3049,15 @@ def _player_lookup_from_parquet(
     if by_number:
         base = players.filter(pl.col("id_number") == pl.lit(query))
     else:
-        base = players.filter(
-            pl.col("name").str.to_lowercase().str.contains(query.lower(), literal=True)
-        )
+        tokens = [token for token in query.lower().replace(",", " ").split() if token]
+        name_expr = pl.lit(True)
+        for token in tokens:
+            name_expr &= (
+                pl.col("name")
+                .str.to_lowercase()
+                .str.contains(token, literal=True)
+            )
+        base = players.filter(name_expr)
     base = base.select("id_number", "name", "city", "state", "mp_total", "pair_summary_id", "transaction_date")
     if club_id:
         pairs = _parquet_scan("pair_summaries")
@@ -3081,11 +3088,13 @@ def _player_lookup_from_parquet(
     )
     df = _collect_retry(lazy)
     if df is None or df.is_empty():
-        return []
+        if by_number or club_id:
+            return []
+        return _fuzzy_player_lookup_from_parquet(query, limit)
     return [
         {
             "player_number": rec.get("id_number"),
-            "player_name": rec.get("name"),
+            "player_name": _given_name_first(rec.get("name")),
             "city": rec.get("city"),
             "state": rec.get("state"),
             "mp_total": rec.get("mp_total"),
@@ -3095,6 +3104,75 @@ def _player_lookup_from_parquet(
         }
         for rec in df.to_dicts()
     ]
+
+
+def _fuzzy_player_lookup_from_parquet(
+    query: str, limit: int
+) -> List[Dict[str, Any]]:
+    """Return typo-tolerant name matches from a bounded candidate set."""
+    players = _parquet_scan("players")
+    if players is None:
+        return []
+    tokens = [
+        token for token in query.lower().replace(",", " ").split()
+        if token
+    ]
+    candidate_expr = pl.lit(False)
+    for token in tokens:
+        fragments = (
+            {token[index:index + 3] for index in range(len(token) - 2)}
+            if len(token) >= 3 else {token}
+        )
+        for fragment in fragments:
+            candidate_expr |= (
+                pl.col("name")
+                .str.to_lowercase()
+                .str.contains(fragment, literal=True)
+            )
+    lazy = (
+        players.filter(candidate_expr)
+        .select(
+            "id_number", "name", "city", "state", "mp_total",
+            "transaction_date",
+        )
+        .sort("transaction_date")
+        .group_by("id_number")
+        .agg(
+            pl.col("name").last(),
+            pl.col("city").last(),
+            pl.col("state").last(),
+            pl.col("mp_total").last(),
+            pl.len().alias("club_sessions"),
+        )
+    )
+    frame = _collect_retry(lazy)
+    if frame is None or frame.is_empty():
+        return []
+    query_for_score = " ".join(tokens)
+    rows = []
+    for rec in frame.to_dicts():
+        player_number = str(rec.get("id_number") or "").strip()
+        if not player_number.isdigit():
+            continue
+        name = _given_name_first(rec.get("name"))
+        score = round(fuzz.WRatio(
+            query_for_score, str(name or "").lower()), 1)
+        if score < 55:
+            continue
+        rows.append({
+            "player_number": player_number,
+            "player_name": name,
+            "city": rec.get("city"),
+            "state": rec.get("state"),
+            "mp_total": rec.get("mp_total"),
+            "club_sessions": rec.get("club_sessions"),
+            "club_id": None,
+            "match_score": score,
+            "source": "club_results_parquet_fuzzy",
+        })
+    rows.sort(key=lambda row: (
+        -row["match_score"], str(row.get("player_name") or "")))
+    return rows[:limit]
 
 
 def _lookup_from_parquet(query: str, by_number: bool, limit: int) -> List[Dict[str, Any]]:
@@ -3168,9 +3246,15 @@ def player_lookup(
 
     if by_number:
         rows = [r for r in rows if str(r.get("player_number") or "") == q]
-    else:
-        needle = q.lower()
-        rows = [r for r in rows if needle in str(r.get("player_name") or "").lower()]
+    elif session_id:
+        tokens = [token for token in q.lower().replace(",", " ").split() if token]
+        rows = [
+            r for r in rows
+            if all(
+                token in str(r.get("player_name") or "").lower()
+                for token in tokens
+            )
+        ]
 
     if not rows:
         parquet_rows = _lookup_from_parquet(q, by_number=by_number, limit=cap)
