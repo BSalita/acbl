@@ -1798,6 +1798,7 @@ def tournament_player_sessions(
     player_id: str,
     limit: Optional[int] = None,
     refresh: bool = False,
+    tournament_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     pid = str(player_id).strip()
     if not pid.isdigit():
@@ -1870,6 +1871,24 @@ def tournament_player_sessions(
         key=lambda row: (str(row.get("date") or ""), str(row["session_id"])),
         reverse=True,
     )
+    name_query = str(tournament_name or "").strip()
+    if name_query:
+        matched_rows = []
+        for row in rows:
+            candidate = " ".join(
+                str(row.get(key) or "")
+                for key in ("tournament_name", "event_name", "event_type")
+            )
+            score = float(fuzz.WRatio(name_query, candidate))
+            if score >= 55.0:
+                matched_rows.append({**row, "match_score": round(score, 1)})
+        rows = sorted(
+            matched_rows,
+            key=lambda row: (
+                -float(row["match_score"]),
+                str(row.get("date") or ""),
+            ),
+        )
     return rows_to_table(
         rows,
         limit=cap,
@@ -3028,9 +3047,18 @@ def club_list(query: Optional[str] = None, limit: Optional[int] = None, refresh:
         filtered = []
         for row in rows:
             blob = " ".join(str(v) for v in row.values() if v is not None).lower()
-            if q in blob:
-                filtered.append(row)
-        rows = filtered
+            score = 100.0 if q in blob else float(fuzz.WRatio(q, blob))
+            if score >= 55.0:
+                matched = dict(row)
+                matched["match_score"] = round(score, 1)
+                filtered.append(matched)
+        rows = sorted(
+            filtered,
+            key=lambda row: (
+                -float(row["match_score"]),
+                str(row.get("club_name") or ""),
+            ),
+        )
     return rows_to_table(
         rows,
         limit=cap,

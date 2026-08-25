@@ -73,7 +73,9 @@ def get_club_dataset_info(response: Response) -> dict:
 
 @app.get("/clubs")
 def get_clubs(
-    q: Optional[str] = Query(None, description="Substring filter on club id/name/location"),
+    q: Optional[str] = Query(
+        None, description="Typo-tolerant filter on club id/name/location"
+    ),
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
 ) -> dict:
@@ -134,9 +136,16 @@ def get_tournament_player_sessions(
     player_id: str,
     limit: int = Query(svc.DEFAULT_ROW_LIMIT, ge=1, le=svc.MAX_ROW_LIMIT),
     refresh: bool = Query(False),
+    tournament_name: Optional[str] = Query(
+        None, description="Typo-tolerant tournament/event name filter"
+    ),
 ) -> dict:
     return svc.tournament_player_sessions(
-        player_id, limit=limit, refresh=refresh)
+        player_id,
+        limit=limit,
+        refresh=refresh,
+        tournament_name=tournament_name,
+    )
 
 
 @app.get("/sessions/{session_id}/tables")

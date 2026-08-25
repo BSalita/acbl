@@ -72,12 +72,17 @@ def acbl_tournament_player_sessions(
     player_id: str,
     limit: int = 200,
     refresh: bool = True,
+    tournament_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Tournament sessions for a player, merging historical parquet with the
-    latest official ACBL API listing."""
+    latest first-party API listing. tournament_name is typo-tolerant."""
     return _api_get(
         f"/tournaments/players/{player_id}/sessions",
-        {"limit": limit, "refresh": refresh},
+        {
+            "limit": limit,
+            "refresh": refresh,
+            "tournament_name": tournament_name,
+        },
     )
 
 

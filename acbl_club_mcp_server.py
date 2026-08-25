@@ -74,7 +74,7 @@ def acbl_dataset_info() -> Dict[str, Any]:
 @mcp.tool()
 def acbl_club_list(q: Optional[str] = None, limit: int = 200, refresh: bool = False) -> Dict[str, Any]:
     """Directory of ACBL clubs (club_id, name, location). q is an optional
-    substring filter. refresh=True re-scrapes https://my.acbl.org/club-results."""
+    typo-tolerant text filter. refresh=True refreshes the first-party API."""
     return _club_get("/clubs", {"q": q, "limit": limit, "refresh": refresh})
 
 
