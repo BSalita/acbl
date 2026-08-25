@@ -21,16 +21,15 @@ echo    ..\Elo_Ratings          (player/pair Elo parquets)
 echo    ..\Bridge_Game_Postmortem_Chatbot (SavedModels, Elo parquets)
 echo.
 echo  Approximate end-to-end wall time on the dev box
-echo  (192 GB RAM, ~40-core CPU, NVMe E:, RTX 5080):
-echo    Cold start (no caches, fresh DD/SD work): ~2 days dominated by 3a (~38 h)
-echo    Warm rerun  (3a cache hits, just incremental work): ~10-12 h + 5c
-echo      (was ~12-14 h; 5a shard-output change of 2026-08-16 removed the
-echo       single-file merge and cut 5a to ~15 min tournament / ~1 min resume.
-echo       5b now reads shards too -- remeasure on next full run.)
-echo    Stage 5c (train all 6 models) measured 30.4 h on 2026-07-10 -^> 2026-07-11.
+echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
+echo    Cold start (no caches, fresh DD/SD work): ~4 days
+echo      (~38 h Stage 3a + ~45 h Stage 5c + other stages).
+echo    Warm rerun (3a cache hits): ~55-57 h end-to-end
+echo      (~10-12 h Stages 1-5b + ~45 h Stage 5c).
+echo    Stage 5c current baseline: ~45 h for all 6 models (2026-08-23 -^> 08-26).
 echo    Empirical bottlenecks per stage are noted as "TIME:" tags below.
 echo    Each step prints its own measured elapsed time as "TIME[step]: ..." lines.
-echo  Last full-pipeline timing baseline: 2026-07-07 -^> 2026-07-11 (see logs/).
+echo  Latest complete outputs: 2026-08-14 -^> 2026-08-26 (5c used resumed target runs).
 echo  Model training results history: RESULTS.md (append an entry after each 5c run).
 echo ======================================================================
 echo.
@@ -221,26 +220,45 @@ call :pyrun 5b acbl_prediction_data.py
 if errorlevel 1 goto :error
 
 :: ---- 5c ----
-:: READS:  acbl/acbl_{club,tournament}_prediction_data_train.parquet
-::         acbl/acbl_{club,tournament}_prediction_data_test.parquet
+:: READS:  acbl/acbl_{club,tournament}_prediction_data_train_v2.parquet
+::         acbl/acbl_{club,tournament}_prediction_data_test_v2.parquet
 :: WRITES: acbl/SavedModels/{model_name}_schema.json                -> Chatbot
-::         acbl/SavedModels/*model_shard_*.pt                       -> Chatbot
+::         acbl/SavedModels/{model_name}.pth                        -> Chatbot
+::         acbl/SavedModels/*model_shard_*.pt                       (transient)
 ::         acbl/SavedModels/{model_name}_importance.csv
 ::         acbl/debug_input_{y_name}.parquet
 ::         acbl/debug_predictions_{y_name}.parquet
-:: TIME:   30.4 h TOTAL for all 6 models (both modes x 3 targets), 20 epochs
-::         each on RTX 5080. Wall clock measured 2026-07-10 14:42 -> 2026-07-11 21:05.
-::         club (84716 s = 23.5 h):
-::           Declarer_Direction: shards 2h15m + train 6h10m (~1110 s/epoch)
-::           Contract:           shards 2h35m + train 6h33m (~1178 s/epoch)
-::           Pct_NS (pruned):    shards   13m + train 1h28m (~262 s/epoch)
-::         tournament (24244 s = 6.7 h):
-::           Declarer_Direction: shards   41m + train 1h35m (~284 s/epoch)
-::           Contract:           shards   40m + train 1h48m (~324 s/epoch)
-::           Pct_NS (pruned):    shards    4m + train   14m (early stop @15)
-::         DISK: club shard sets peak at ~1.25 TB on E: (28 x ~45 GB
-::         uncompressed float32); ensure ~1.3 TB free before this step
-::         (a full E: caused a torch.save iostream crash on 2026-07-09).
+:: TIME:   CURRENT BASELINE ~45 h for all 6 models, 20 epochs each.
+::         Reconstructed from successful target-specific runs on
+::         2026-08-23 -> 2026-08-26; a clean uninterrupted run avoids duplicate
+::         parquet loading and is expected to take ~44-46 h.
+::         Input sizes:
+::           club:      61.71M train + 7.74M test rows, ~218.5 + 21.9 GB
+::           tournament:15.70M train + 1.03M test rows, ~44.5 + 2.9 GB
+::         club (~36-37 h clean-run estimate):
+::           Declarer_Direction: shards 4h28m + epochs 9h39m (~1737 s/epoch)
+::           Contract:           shards 4h30m + epochs 10h10m (~1830 s/epoch)
+::           Pct_NS (pruned):    shards   42m + epochs 1h26m (~259 s/epoch)
+::           Measured resumed Contract+Pct_NS process: 22.03 h total.
+::         tournament (~8-8.5 h clean-run estimate):
+::           Declarer_Direction: shards 1h11m + epochs 2h31m (~454 s/epoch)
+::           Contract:           shards   56m + epochs 2h38m (~473 s/epoch)
+::           Pct_NS (pruned):    shards   10m + epochs   18m (~53 s/epoch)
+::           Measured resumed Contract+Pct_NS process: 4.49 h total.
+::         HOST MEMORY: this is the bottleneck, not VRAM. Full-width club data
+::         drove Python to ~488 GB working set. The dev box uses 512 GB physical
+::         RAM plus a fixed 1.8 TB K: pagefile (~2.27 TB total commit). Do not
+::         disable/reduce that pagefile. mlBridgeAiLib.df_to_float32_matrix
+::         builds inference/shard matrices in bounded column/row chunks; do not
+::         replace it with select(...).to_numpy().astype(float32), which caused
+::         45-373 GB transient allocations and commit-limit failures.
+::         GPU MEMORY: observed peak was only ~0.38 GB Declarer_Direction,
+::         ~0.58 GB Contract, and ~0.43 GB Pct_NS on the RTX 5080.
+::         DISK: full-width club models create 62 transient shards (61 x
+::         ~22.48 GiB + one ~15.86 GiB = ~1.36 TiB) under SavedModels.
+::         E:\...\SavedModels is a junction to F:\...\SavedModels; ensure at
+::         least 1.5 TiB free on F: before 5c. Shards are deleted before the
+::         next target, so only one target's shard set should exist at a time.
 ::         Run this step alone (not via acbl_all.bat) when iterating on models.
 echo   [5c] Training prediction models...
 call :pyrun 5c acbl_prediction_train.py
@@ -270,7 +288,7 @@ echo  ..\Bridge_Game_Postmortem_Chatbot:
 echo    acbl_{club,tournament}_player_elo_ratings.parquet  (player lookup)
 echo    acbl_{club,tournament}_pair_elo_ratings.parquet    (pair lookup)
 echo    SavedModels\*_schema.json                         (model schemas)
-echo    SavedModels\*model_shard_*.pt                     (trained weights)
+echo    SavedModels\*.pth                                 (trained weights)
 echo ======================================================================
 del /q "%STEP_OK%" 2>nul
 goto :eof
