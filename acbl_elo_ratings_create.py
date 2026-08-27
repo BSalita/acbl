@@ -38,6 +38,12 @@ acblPath = rootPath.joinpath('acbl')
 # Elo formula. The Streamlit/API can override at query time.
 SHRINKAGE_DEFAULT_PRIOR_SESSIONS = 50
 
+# Persist Elo from the first session. Sample-size eligibility belongs to the
+# report's min_sessions filter, while Bayesian shrinkage controls provisional
+# volatility. Masking the first nine sessions here made reports count only
+# post-threshold sessions and silently applied the minimum twice.
+PERSISTED_ELO_MINIMUM_SESSIONS = 1
+
 
 def _compute_shrinkage_metadata(
     player_elo_lookup: pl.DataFrame,
@@ -179,7 +185,7 @@ def create_elo_ratings(club_or_tournament):
     
     # Select only necessary columns
     regex_cols = [
-            'Date', 'is_virtual_game', 'session_id', 'Round', 'Board', 'Pair_Number_(NS|EW)',
+            'Date', 'is_virtual_game', 'session_id', 'event_id', 'Round', 'Board', 'Pair_Number_(NS|EW)',
             'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)',
             'MasterPoints_[NESW]', 'MasterPoints_(NS|EW)', 'Pct_NS',
             'DD_Tricks_Diff', 'Is_Par_Suit', 'Is_Par_Contract', 'Is_Sacrifice', # must use board results augmented to get these columns
@@ -237,6 +243,7 @@ def create_elo_ratings(club_or_tournament):
     print("Computing matchpoint Elo ratings...")
     df = mlBridgeAugmentLib.compute_matchpoint_elo_ratings(
         df,
+        minimum_sessions=PERSISTED_ELO_MINIMUM_SESSIONS,
         pair_global_stdev_ns=seeds.get("pair_ns"),
         pair_global_stdev_ew=seeds.get("pair_ew"),
         player_global_stdev_ns=seeds.get("player_ns"),

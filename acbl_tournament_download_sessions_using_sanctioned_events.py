@@ -29,6 +29,7 @@ import pathlib
 import sys
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 import requests
@@ -43,39 +44,57 @@ def _iter_files_sorted(paths: Iterable[pathlib.Path]) -> list[pathlib.Path]:
 
 
 def _load_sanction_event_files(events_dir: pathlib.Path) -> list[pathlib.Path]:
-    return _iter_files_sorted(events_dir.rglob("*.sanction.json"))
+    # Ignore filesystem/editor artifacts such as the historical
+    # ``.sanction.json`` placeholder; real event files always have a visible id.
+    return _iter_files_sorted(
+        path
+        for path in events_dir.rglob("*.sanction.json")
+        if not path.name.startswith(".")
+    )
 
 
 def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[str]:
     """
     Read `*.sanction.json` files and return unique session ids (sorted desc).
+
+    Use the event API's canonical ``id`` as the session-id prefix. Rebuilding
+    the prefix from ``sanction`` + ``event_code`` is wrong for NABCs: for
+    example, the 2026 Oshlag event id is ``NABC262-OSHL`` while its accounting
+    sanction is ``2607001``. The session endpoint expects
+    ``NABC262-OSHL-<n>``.
     """
     event_files = _load_sanction_event_files(events_dir)
     sessions: list[str] = []
+    invalid_files: list[str] = []
 
     for fp in event_files:
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 event = json.load(f)
-        except Exception:
-            # Keep going; corrupted file should not block the run.
+        except (OSError, json.JSONDecodeError):
+            invalid_files.append(fp.as_posix())
             continue
 
-        sanction = event.get("sanction")
-        if sanction is None:
-            continue
-        event_code = event.get("event_code")
+        event_id = str(event.get("id") or "").strip()
         session_count = event.get("session_count")
-        if event_code is None or session_count is None:
+        if not event_id or session_count is None:
+            invalid_files.append(fp.as_posix())
             continue
 
         try:
             sc = int(session_count)
-        except Exception:
+        except (TypeError, ValueError):
+            invalid_files.append(fp.as_posix())
             continue
 
         for c in range(1, sc + 1):
-            sessions.append("-".join([str(sanction), str(event_code), str(c)]))
+            sessions.append(f"{event_id}-{c}")
+
+    if invalid_files:
+        preview = "\n  ".join(invalid_files[:20])
+        raise ValueError(
+            f"{len(invalid_files)} invalid sanctioned-event files; first entries:\n  {preview}"
+        )
 
     # Notebook sorts reverse to start with newest-ish ids first.
     return sorted(set(sessions), reverse=True)
@@ -87,6 +106,7 @@ def download_tournament_sessions(
     output_dir: pathlib.Path,
     full_monty: int = 1,
     timeout: int = 10,
+    max_attempts: int = 4,
     sleep_seconds: float = 0.0,
     starting_nfile: int = 0,
     ending_nfile: int = 0,
@@ -147,38 +167,67 @@ def download_tournament_sessions(
         if sleep_seconds > 0 and idx > 0:
             time.sleep(sleep_seconds)
 
-        try:
-            response = requests.get(url, headers=headers, timeout=timeout)
-        except KeyboardInterrupt:
-            raise
-        except Exception as ex:
-            errors += 1
-            print(f"Exception: count:{except_count} type:{type(ex).__name__} args:{ex.args}")
-            if except_count > 5:
-                print("Except count exceeded; stopping")
-                break
-            except_count += 1
-            time.sleep(1)  # transient retry delay (notebook behavior)
-            continue
-        else:
-            except_count = 0
+        response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.get(url, headers=headers, timeout=timeout)
+            except KeyboardInterrupt:
+                raise
+            except requests.RequestException as ex:
+                if attempt == max_attempts:
+                    print(
+                        f"ERROR after {max_attempts} attempts: "
+                        f"{type(ex).__name__}: {ex}"
+                    )
+                    break
+                wait_seconds = min(60, 2 ** (attempt - 1))
+                print(
+                    f"Transient request failure ({attempt}/{max_attempts}): "
+                    f"{type(ex).__name__}; retrying in {wait_seconds}s"
+                )
+                time.sleep(wait_seconds)
+                continue
 
-        # Notebook behavior
-        if response.status_code in (400, 404, 500):
-            print(f"Status Code:{response.status_code}: skipping")
-            skipped += 1
-            continue
-        if response.status_code == 504:
-            print(f"Status Code:{response.status_code}: stopping")
+            if response.status_code == 429 or 500 <= response.status_code <= 599:
+                if attempt == max_attempts:
+                    break
+                retry_after = response.headers.get("Retry-After")
+                wait_seconds = (
+                    int(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else min(60, 2 ** (attempt - 1))
+                )
+                print(
+                    f"Transient HTTP {response.status_code} "
+                    f"({attempt}/{max_attempts}); retrying in {wait_seconds}s"
+                )
+                time.sleep(wait_seconds)
+                continue
             break
-        if response.status_code == 429:
-            print("RATE LIMITED: HTTP 429 - waiting 60 seconds...")
-            time.sleep(60)
+
+        if response is None:
+            errors += 1
+            except_count += 1
+            if except_count > 5:
+                print("Consecutive request failures exceeded 5; stopping")
+                break
+            continue
+        except_count = 0
+
+        if response.status_code in (400, 404):
+            errors += 1
+            print(
+                f"ERROR: expected sanctioned session is unavailable "
+                f"(HTTP {response.status_code}): {session_id}"
+            )
             continue
 
         if response.status_code != 200:
             errors += 1
-            print(f"ERROR: HTTP {response.status_code}: url:{url}")
+            print(
+                f"ERROR after {max_attempts} attempts: "
+                f"HTTP {response.status_code}: url:{url}"
+            )
             continue
 
         try:
@@ -203,6 +252,32 @@ def download_tournament_sessions(
             continue
 
     return (written, skipped, errors)
+
+
+def audit_session_artifacts(
+    session_ids: list[str],
+    output_dir: pathlib.Path,
+) -> list[str]:
+    """Write an audit manifest and return expected sessions with no JSON or SQL."""
+    missing = [
+        session_id
+        for session_id in session_ids
+        if not (output_dir / f"{session_id}.session.json").is_file()
+        and not (output_dir / f"{session_id}.session.sql").is_file()
+    ]
+    audit = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "expected_sessions": len(session_ids),
+        "complete_sessions": len(session_ids) - len(missing),
+        "missing_sessions": missing,
+    }
+    audit_path = output_dir / "_session_download_audit.json"
+    audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    print(
+        f"Audit: expected:{len(session_ids)} complete:{len(session_ids) - len(missing)} "
+        f"missing:{len(missing)} -> {audit_path}"
+    )
+    return missing
 
 
 def main() -> int:
@@ -231,6 +306,12 @@ def main() -> int:
         type=int,
         default=10,
         help="Request timeout seconds (default: 10)",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=4,
+        help="Attempts for transient request/HTTP failures (default: 4)",
     )
     parser.add_argument(
         "--sleep",
@@ -270,6 +351,15 @@ def main() -> int:
         help="Do not skip when .session.sql exists",
     )
     parser.set_defaults(skip_if_sql_exists=True)
+    parser.add_argument(
+        "--session-id",
+        action="append",
+        default=[],
+        help=(
+            "Download one exact session id; repeat for multiple ids. "
+            "When supplied, sanctioned-event discovery is skipped."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -294,8 +384,15 @@ def main() -> int:
     print(f"Sleep:        {args.sleep}s")
     print()
 
-    session_ids = build_session_ids_from_sanctioned_events(events_dir)
-    print(f"Derived {len(session_ids):,} unique sessions from sanctioned events")
+    session_ids = (
+        sorted(set(args.session_id), reverse=True)
+        if args.session_id
+        else build_session_ids_from_sanctioned_events(events_dir)
+    )
+    if args.session_id:
+        print(f"Using {len(session_ids):,} explicitly requested session ids")
+    else:
+        print(f"Derived {len(session_ids):,} unique sessions from sanctioned events")
 
     written, skipped, errors = download_tournament_sessions(
         session_ids=session_ids,
@@ -303,17 +400,27 @@ def main() -> int:
         output_dir=sessions_dir,
         full_monty=args.full_monty,
         timeout=args.timeout,
+        max_attempts=args.max_attempts,
         sleep_seconds=args.sleep,
         starting_nfile=args.start,
         ending_nfile=args.end,
         skip_if_json_exists=args.skip_if_json_exists,
         skip_if_sql_exists=args.skip_if_sql_exists,
     )
+    selected_end = args.end or len(session_ids)
+    selected_ids = session_ids[args.start:selected_end]
+    missing = audit_session_artifacts(selected_ids, sessions_dir)
 
     print()
     print("=" * 70)
-    print(f"COMPLETE: written:{written} skipped:{skipped} errors:{errors}")
+    print(
+        f"COMPLETE: written:{written} skipped:{skipped} "
+        f"errors:{errors} missing:{len(missing)}"
+    )
     print("=" * 70)
+    if errors or missing:
+        print("FAILED: unresolved sanctioned sessions remain; downstream rebuild is unsafe.")
+        return 1
     return 0
 
 
