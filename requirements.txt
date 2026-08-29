@@ -19,7 +19,6 @@ endplay
 duckdb
 fastapi
 uvicorn
-mcp
 matplotlib
 requests
 seaborn
