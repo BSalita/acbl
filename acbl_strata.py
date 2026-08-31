@@ -1,7 +1,7 @@
 """ACBL event strata (MP-limit) normalization for Elo board rows.
 
 Used by ``acbl_elo_ratings_create.py`` to write ``mp_limit`` + ``strata_bucket``
-onto Elo parquets. Keep in sync with ``Elo_Ratings/acbl_strata.py`` (API/UI).
+onto Elo parquets. Keep in sync with ``elo/acbl_strata.py`` (API/UI).
 
 K-weighting of Open vs restricted updates lives in
 ``mlBridge.mlBridgeAugmentLib.EVENT_MP_LIMIT_K_SCALE``.

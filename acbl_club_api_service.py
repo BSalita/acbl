@@ -33,7 +33,7 @@ from rapidfuzz import fuzz
 
 _APP_DIR = pathlib.Path(__file__).resolve().parent
 _SRC_DIR = _APP_DIR.parent
-load_dotenv(_SRC_DIR / "Bridge_Game_Postmortem_Chatbot" / ".env")
+load_dotenv(_SRC_DIR / "postmortem-acbl" / ".env")
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
@@ -64,7 +64,7 @@ CLOUDFLARE_HINT = (
     "python acbl_solve_challenge.py, then retry."
 )
 
-_CHATBOT_CACHE = _SRC_DIR / "Bridge_Game_Postmortem_Chatbot" / "club-results"
+_CHATBOT_CACHE = _SRC_DIR / "postmortem-acbl" / "club-results"
 _LOCAL_CACHE = _APP_DIR / "club-results"
 
 
@@ -149,7 +149,7 @@ CACHE_ROOTS: List[pathlib.Path] = [
 ] or [CACHE_DIR]
 # Write scrapes into the archive so stage 1a skips them -- but only when it is
 # writable. In production the archive is a read-only mount of the OneDrive
-# "recent slice" (see src/acbl/u.bat), so writes go to the local cache instead.
+# "recent slice" (see src/acbl-pipeline/u.bat), so writes go to the local cache instead.
 WRITE_CACHE_DIR = (
     ARCHIVE_CACHE_DIR
     if ARCHIVE_CACHE_DIR.is_dir() and os.access(str(ARCHIVE_CACHE_DIR), os.W_OK)

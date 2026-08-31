@@ -75,12 +75,11 @@ _SRC_DIR = pathlib.Path(__file__).resolve().parent.parent
 _MLBRIDGE = _SRC_DIR / 'mlBridge'
 if not _MLBRIDGE.is_dir():
     raise FileNotFoundError(f'mlBridge not found at {_MLBRIDGE}')
-for _p in (_SRC_DIR, _MLBRIDGE):
-    _s = str(_p)
-    if _s not in sys.path:
-        sys.path.append(_s)
+_s = str(_SRC_DIR)
+if _s not in sys.path:
+    sys.path.append(_s)
 import mlBridge
-from mlBridgeAiLib import features_enum
+from mlBridge.mlBridgeAiLib import features_enum
 
 rootPath = pathlib.Path('e:/bridge/data')
 acblPath = rootPath.joinpath('acbl')

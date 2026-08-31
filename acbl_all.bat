@@ -17,8 +17,8 @@ set "STEP_OK=%TEMP%\acbl_all_step.ok"
 echo ======================================================================
 echo  ACBL Full Pipeline
 echo  Produces data files consumed by:
-echo    ..\Elo_Ratings          (player/pair Elo parquets)
-echo    ..\Bridge_Game_Postmortem_Chatbot (SavedModels, Elo parquets)
+echo    ..\elo          (player/pair Elo parquets)
+echo    ..\postmortem-acbl (SavedModels, Elo parquets)
 echo.
 echo  Approximate end-to-end wall time on the dev box
 echo  (512 GB RAM, 64-core CPU, NVMe E:/F:, RTX 5080, 1.8 TB K: pagefile):
@@ -162,8 +162,8 @@ echo [Stage 4] Elo ratings...
 :: ---- 4 ----
 :: READS:  acbl/acbl_{club,tournament}_board_results_augmented.parquet
 :: WRITES: acbl/acbl_{club,tournament}_elo_ratings.parquet
-::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> Elo_Ratings, Chatbot
-::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> Elo_Ratings, Chatbot
+::         acbl/acbl_{club,tournament}_player_elo_ratings.parquet  -> elo, postmortem-acbl
+::         acbl/acbl_{club,tournament}_pair_elo_ratings.parquet    -> elo, postmortem-acbl
 :: TIME:   ~30-60 min total (tournament ~10 min, club ~30-45 min).
 ::         Walks games chronologically; mostly single-threaded.
 echo   [4] Computing Elo ratings (player + pair)...
@@ -279,12 +279,12 @@ echo  TIME[total]: %PIPE_ELAPSED%s (%PIPE_H%h %PIPE_M%m %PIPE_S%s)
 echo.
 echo  Downstream consumers and their required files:
 echo.
-echo  ..\Elo_Ratings:
+echo  ..\elo:
 echo    acbl_{club,tournament}_elo_ratings.parquet         (full Elo history)
 echo    acbl_{club,tournament}_player_elo_ratings.parquet  (player lookup)
 echo    acbl_{club,tournament}_pair_elo_ratings.parquet    (pair lookup)
 echo.
-echo  ..\Bridge_Game_Postmortem_Chatbot:
+echo  ..\postmortem-acbl:
 echo    acbl_{club,tournament}_player_elo_ratings.parquet  (player lookup)
 echo    acbl_{club,tournament}_pair_elo_ratings.parquet    (pair lookup)
 echo    SavedModels\*_schema.json                         (model schemas)

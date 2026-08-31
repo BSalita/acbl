@@ -189,6 +189,9 @@ def create_elo_ratings(club_or_tournament):
             'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)',
             'MasterPoints_[NESW]', 'MasterPoints_(NS|EW)', 'Pct_NS',
             'DD_Tricks_Diff', 'Is_Par_Suit', 'Is_Par_Contract', 'Is_Sacrifice', # must use board results augmented to get these columns
+            'Declarer_Direction', 'Declarer_Pair_Direction', 'BidSuit', 'ParContracts',
+            'DD_Score_NS', 'DD_Score_EW', 'DD_Score_Declarer',
+            'Par_NS', 'Par_EW', 'Par_Declarer',
             'mp_limit',  # event MP ceiling for Strata filter (club mpLimits / tournament mp_limit)
         ]
     read_cols = [col for col in df.columns if any(re.match(regex, col) for regex in regex_cols)]
