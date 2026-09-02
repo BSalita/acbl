@@ -3,10 +3,13 @@ ACBL Tournament Sessions Downloader (from sanctioned events)
 
 Script version of `acbl_tournament_download_sessions_using_sanctioned_events.ipynb`.
 
-Reads `tournaments/events/*.sanction.json` files (downloaded previously) and derives
-session ids of the form:
+Reads `tournaments/events/*.sanction.json` files (downloaded previously) and
+derives session ids from the event API's canonical ``id``:
 
-  <sanction>-<event_code>-<session_number>
+  <event_id>-<session_number>
+
+NABC live sessions use ``NABC262-OSHL-1``, not the accounting-sanction form
+``2607001-OSHL-1``.
 
 Then downloads each session payload from:
   https://api.acbl.org/v1/tournament/session?id=<session_id>&full_monty=1
@@ -14,10 +17,11 @@ Then downloads each session payload from:
 and writes:
   tournaments/sessions/<session_id>.session.json
 
-Behavior notes (matches notebook):
-  - Skips if `<session_id>.session.json` already exists
-  - Also skips if `<session_id>.session.sql` exists (downstream pipeline may have converted it)
-  - Skips 400/404/500 responses, stops on 504
+Behavior:
+  - Skips if ``<session_id>.session.json`` or ``.session.sql`` already exists
+  - 400/404 are unavailable (cancelled, unpublished, no boards) and do not
+    fail the run; they are retried on the next invocation
+  - Timeouts and 429/5xx are retried; exhausted attempts fail the run
 """
 
 from __future__ import annotations
@@ -29,14 +33,19 @@ import pathlib
 import sys
 import time
 import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable
 
 import requests
 from dotenv import load_dotenv
 
 rootPath = pathlib.Path("e:/bridge/data")
 acblPath = rootPath.joinpath("acbl")
+
+DEFAULT_TIMEOUT_SECONDS = 90
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+UNAVAILABLE_HTTP_STATUSES = frozenset({400, 404})
 
 
 def _iter_files_sorted(paths: Iterable[pathlib.Path]) -> list[pathlib.Path]:
@@ -100,12 +109,39 @@ def build_session_ids_from_sanctioned_events(events_dir: pathlib.Path) -> list[s
     return sorted(set(sessions), reverse=True)
 
 
+def session_request_timeout(timeout_seconds: int) -> tuple[float, float]:
+    """Connect/read timeout pair. Large NABC full_monty payloads need a long read."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    read = float(timeout_seconds)
+    connect = min(float(DEFAULT_CONNECT_TIMEOUT_SECONDS), read)
+    return (connect, read)
+
+
+def is_unavailable_http(status_code: int) -> bool:
+    """True for permanent-for-this-run HTTP statuses (unpublished / no boards)."""
+    return status_code in UNAVAILABLE_HTTP_STATUSES
+
+
+@dataclass
+class DownloadStats:
+    written: int = 0
+    skipped: int = 0
+    errors: int = 0
+    unavailable: int = 0
+    aborted: bool = False
+    unavailable_ids: list[str] = field(default_factory=list)
+
+    def failed(self) -> bool:
+        return self.aborted or self.errors > 0
+
+
 def download_tournament_sessions(
     session_ids: list[str],
     api_key: str,
     output_dir: pathlib.Path,
     full_monty: int = 1,
-    timeout: int = 10,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
     max_attempts: int = 4,
     sleep_seconds: float = 0.0,
     starting_nfile: int = 0,
@@ -113,13 +149,8 @@ def download_tournament_sessions(
     skip_if_json_exists: bool = True,
     skip_if_sql_exists: bool = True,
     delete_partial_json_on_error: bool = True,
-) -> tuple[int, int, int]:
-    """
-    Download tournament session JSON payloads.
-
-    Returns:
-        (written_count, skipped_count, error_count)
-    """
+) -> DownloadStats:
+    """Download tournament session JSON payloads."""
     headers = {
         "Accept": "application/json",
         "Authorization": "Bearer " + api_key,
@@ -139,9 +170,8 @@ def download_tournament_sessions(
     filtered = session_ids[starting_nfile:ending_nfile]
     total = len(filtered)
 
-    written = 0
-    skipped = 0
-    errors = 0
+    stats = DownloadStats()
+    request_timeout = session_request_timeout(timeout)
 
     except_count = 0
     start_run = time.time()
@@ -152,11 +182,11 @@ def download_tournament_sessions(
 
         if skip_if_sql_exists and file_sql.exists():
             print(f"{idx}/{total}: File exists: {file_sql}: skipping")
-            skipped += 1
+            stats.skipped += 1
             continue
         if skip_if_json_exists and file_json.exists():
             print(f"{idx}/{total}: File exists: {file_json}: skipping")
-            skipped += 1
+            stats.skipped += 1
             continue
 
         query = {"id": session_id, "full_monty": full_monty}
@@ -170,7 +200,7 @@ def download_tournament_sessions(
         response = None
         for attempt in range(1, max_attempts + 1):
             try:
-                response = requests.get(url, headers=headers, timeout=timeout)
+                response = requests.get(url, headers=headers, timeout=request_timeout)
             except KeyboardInterrupt:
                 raise
             except requests.RequestException as ex:
@@ -206,24 +236,26 @@ def download_tournament_sessions(
             break
 
         if response is None:
-            errors += 1
+            stats.errors += 1
             except_count += 1
             if except_count > 5:
                 print("Consecutive request failures exceeded 5; stopping")
+                stats.aborted = True
                 break
             continue
         except_count = 0
 
-        if response.status_code in (400, 404):
-            errors += 1
+        if is_unavailable_http(response.status_code):
+            stats.unavailable += 1
+            stats.unavailable_ids.append(session_id)
             print(
-                f"ERROR: expected sanctioned session is unavailable "
-                f"(HTTP {response.status_code}): {session_id}"
+                f"UNAVAILABLE (HTTP {response.status_code}): {session_id} "
+                f"(will retry next run)"
             )
             continue
 
         if response.status_code != 200:
-            errors += 1
+            stats.errors += 1
             print(
                 f"ERROR after {max_attempts} attempts: "
                 f"HTTP {response.status_code}: url:{url}"
@@ -240,23 +272,24 @@ def download_tournament_sessions(
             print(f"{idx}/{total}: Writing:{file_json} size:{len(json_pretty)}")
             with open(file_json, "w", encoding="utf-8") as f:
                 f.write(json_pretty)
-            written += 1
+            stats.written += 1
         except KeyboardInterrupt:
             raise
         except Exception:
-            errors += 1
+            stats.errors += 1
             if delete_partial_json_on_error:
                 file_json.unlink(missing_ok=True)
             print("ERROR writing response JSON")
             print(response.text[:500])
             continue
 
-    return (written, skipped, errors)
+    return stats
 
 
 def audit_session_artifacts(
     session_ids: list[str],
     output_dir: pathlib.Path,
+    unavailable_ids: Iterable[str] | None = None,
 ) -> list[str]:
     """Write an audit manifest and return expected sessions with no JSON or SQL."""
     missing = [
@@ -265,17 +298,21 @@ def audit_session_artifacts(
         if not (output_dir / f"{session_id}.session.json").is_file()
         and not (output_dir / f"{session_id}.session.sql").is_file()
     ]
+    unavailable = [sid for sid in missing if sid in set(unavailable_ids or [])]
+    unresolved = [sid for sid in missing if sid not in set(unavailable)]
     audit = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "expected_sessions": len(session_ids),
         "complete_sessions": len(session_ids) - len(missing),
         "missing_sessions": missing,
+        "unavailable_sessions": unavailable,
+        "unresolved_sessions": unresolved,
     }
     audit_path = output_dir / "_session_download_audit.json"
     audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     print(
         f"Audit: expected:{len(session_ids)} complete:{len(session_ids) - len(missing)} "
-        f"missing:{len(missing)} -> {audit_path}"
+        f"unavailable:{len(unavailable)} unresolved:{len(unresolved)} -> {audit_path}"
     )
     return missing
 
@@ -304,8 +341,12 @@ def main() -> int:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=10,
-        help="Request timeout seconds (default: 10)",
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=(
+            f"Read timeout seconds; connect timeout is "
+            f"{DEFAULT_CONNECT_TIMEOUT_SECONDS}s "
+            f"(default: {DEFAULT_TIMEOUT_SECONDS})"
+        ),
     )
     parser.add_argument(
         "--max-attempts",
@@ -381,6 +422,7 @@ def main() -> int:
     print(f"Events dir:   {events_dir}")
     print(f"Sessions dir: {sessions_dir}")
     print(f"Start/end:    {args.start}/{args.end or 'all'}")
+    print(f"Timeout:      {session_request_timeout(args.timeout)} (connect, read)")
     print(f"Sleep:        {args.sleep}s")
     print()
 
@@ -394,7 +436,7 @@ def main() -> int:
     else:
         print(f"Derived {len(session_ids):,} unique sessions from sanctioned events")
 
-    written, skipped, errors = download_tournament_sessions(
+    stats = download_tournament_sessions(
         session_ids=session_ids,
         api_key=api_key,
         output_dir=sessions_dir,
@@ -409,18 +451,31 @@ def main() -> int:
     )
     selected_end = args.end or len(session_ids)
     selected_ids = session_ids[args.start:selected_end]
-    missing = audit_session_artifacts(selected_ids, sessions_dir)
+    missing = audit_session_artifacts(
+        selected_ids,
+        sessions_dir,
+        unavailable_ids=stats.unavailable_ids,
+    )
 
     print()
     print("=" * 70)
     print(
-        f"COMPLETE: written:{written} skipped:{skipped} "
-        f"errors:{errors} missing:{len(missing)}"
+        f"COMPLETE: written:{stats.written} skipped:{stats.skipped} "
+        f"errors:{stats.errors} unavailable:{stats.unavailable} "
+        f"missing:{len(missing)}"
     )
     print("=" * 70)
-    if errors or missing:
-        print("FAILED: unresolved sanctioned sessions remain; downstream rebuild is unsafe.")
+    if stats.failed():
+        print(
+            "FAILED: hard download errors remain; "
+            "downstream rebuild is unsafe."
+        )
         return 1
+    if stats.unavailable:
+        print(
+            f"OK with {stats.unavailable} unavailable session(s) "
+            f"(HTTP 400/404). They will be retried on the next run."
+        )
     return 0
 
 

@@ -76,8 +76,10 @@ if errorlevel 1 goto :error
 :: READS:  acbl/tournaments/events/*.sanction.json
 :: WRITES: acbl/tournaments/sessions/{session_id}.session.json
 :: TIME:   incremental; ~minutes daily, several hours cold start (API-bound).
+::         90s read timeout covers large NABC full_monty payloads.
+::         HTTP 400/404 (unpublished / no boards) do not fail the step.
 echo   [1d] Downloading tournament sessions...
-call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py
+call :pyrun 1d acbl_tournament_download_sessions_using_sanctioned_events.py --timeout 90
 if errorlevel 1 goto :error
 
 :: ---- 1e ----
