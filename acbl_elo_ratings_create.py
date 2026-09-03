@@ -123,6 +123,20 @@ def _compute_shrinkage_metadata(
     return meta
 
 
+def _sanitize_session_mp_top(df: pl.DataFrame) -> pl.DataFrame:
+    """Replace per-row MP_Top with the session median when the column exists.
+
+    A single poison row (Thomas: MP_Top=320 vs session 16) inflates the
+    section-scale cap and multiplies a corrupt Pct_NS residual.
+    """
+    if "MP_Top" not in df.columns:
+        return df
+    print("Replacing per-row MP_Top with session median...")
+    return df.with_columns(
+        pl.col("MP_Top").median().over("session_id").alias("MP_Top")
+    )
+
+
 def _read_global_stdev_seeds(parquet_path: pathlib.Path) -> dict:
     """Read same-direction global Elo stdev from a previous-run parquet.
 
@@ -185,14 +199,16 @@ def create_elo_ratings(club_or_tournament):
     
     # Select only necessary columns
     regex_cols = [
-            'Date', 'is_virtual_game', 'session_id', 'event_id', 'Round', 'Board', 'Pair_Number_(NS|EW)',
-            'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)',
+            'Date', 'is_virtual_game', 'session_id', 'event_id', 'event_name',
+            'Round', 'Board', 'Pair_Number_(NS|EW)',
+            'Player_ID_[NESW]', 'Player_Name_[NESW]', 'MP_(NS|EW)', 'MP_Top',
             'MasterPoints_[NESW]', 'MasterPoints_(NS|EW)', 'Pct_NS',
             'DD_Tricks_Diff', 'Is_Par_Suit', 'Is_Par_Contract', 'Is_Sacrifice', # must use board results augmented to get these columns
             'Declarer_Direction', 'Declarer_Pair_Direction', 'BidSuit', 'ParContracts',
             'DD_Score_NS', 'DD_Score_EW', 'DD_Score_Declarer',
             'Par_NS', 'Par_EW', 'Par_Declarer',
             'mp_limit',  # event MP ceiling for Strata filter (club mpLimits / tournament mp_limit)
+            'mp_color', 'mp_rating',  # tournament platinum identity; unused on club
         ]
     read_cols = [col for col in df.columns if any(re.match(regex, col) for regex in regex_cols)]
     
@@ -241,6 +257,8 @@ def create_elo_ratings(club_or_tournament):
     if 'Round' not in df.columns:
         sort_keys.remove('Round')
     df = df.sort(sort_keys)
+
+    df = _sanitize_session_mp_top(df)
     
     # Compute Elo ratings
     print("Computing matchpoint Elo ratings...")
