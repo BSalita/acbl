@@ -1666,6 +1666,27 @@ def historical_club_player_sessions(
     )
 
 
+def _tournament_results_url(session_id: str) -> Optional[str]:
+    """Public web2 recap. live.acbl.org NABC pages require login."""
+    session = str(session_id).strip()
+    if not session:
+        return None
+    nabc = re.match(r"^(NABC\d+)", session, re.IGNORECASE)
+    if nabc:
+        return (
+            "https://web2.acbl.org/tournaments/Results/NABC/"
+            f"{nabc.group(1).upper()}.HTM"
+        )
+    sanction = re.match(r"^(\d{7})(?:-|$)", session)
+    if sanction:
+        code = sanction.group(1)
+        return (
+            "https://web2.acbl.org/tournaments/results/"
+            f"20{code[:2]}/{code[2:4]}/{code}.htm"
+        )
+    return None
+
+
 def _historical_tournament_player_sessions(
     player_id: str,
 ) -> List[Dict[str, Any]]:
@@ -1730,10 +1751,7 @@ def _historical_tournament_player_sessions(
             "event_type": "Pairs",
             "boards": True,
             "unavailable_reason": None,
-            "details_url": (
-                "https://live.acbl.org/event/"
-                f"{str(row['session_id']).replace('-', '/')}/summary"
-            ),
+            "details_url": _tournament_results_url(str(row["session_id"])),
             "listing_source": "historical tournament augmented parquet",
         }
         for row in frame.to_dicts()
@@ -1783,10 +1801,7 @@ def _live_tournament_player_sessions(
                     "unavailable_reason": (
                         None if has_boards else "no_board_results"
                     ),
-                    "details_url": (
-                        "https://live.acbl.org/event/"
-                        f"{sid.replace('-', '/')}/summary"
-                    ),
+                    "details_url": _tournament_results_url(sid),
                     "listing_source": listing_source,
                 }
             )
